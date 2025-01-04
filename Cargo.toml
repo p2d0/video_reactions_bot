@@ -1,0 +1,8 @@
+[package]
+name = "reaction_bot"
+version = "0.0.1"
+authors = [ "Andrew Cerkin <cerkin-3@yandex.ru>" ]
+
+[dependencies]
+
+[dev-dependencies]
