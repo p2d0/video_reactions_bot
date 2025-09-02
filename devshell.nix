@@ -4,9 +4,9 @@ with pkgs;
 
 # Configure your development environment.
 devshell.mkShell {
-  name = "reaction_bot";
+  name = "standing_bot";
   motd = ''
-Entered reaction_bot app development environment.
+Entered standing_bot app development environment.
 '';
   env = [
     {
@@ -15,6 +15,7 @@ Entered reaction_bot app development environment.
     }
   ];
   packages = [
+    sqlite
     pkg-config
     openssl.dev
     libiconv
