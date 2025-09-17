@@ -11,10 +11,18 @@ Entered standing_bot app development environment.
   env = [
     {
       name = "PKG_CONFIG_PATH";
-      value = "${openssl.dev}/lib/pkgconfig";
+      value = "${openssl.dev}/lib/pkgconfig:${opencv4}/lib/pkgconfig:${ffmpeg.dev}/lib/pkgconfig";
+    }
+    {
+      name = "LIBCLANG_PATH";
+      value = "${libclang.lib}/lib";
     }
   ];
   packages = [
+    ffmpeg.dev
+    libclang.lib
+    # opencv.cxxdev
+    opencv4
     sqlite
     pkg-config
     openssl.dev
