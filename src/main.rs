@@ -5,8 +5,8 @@ use tokio::fs;
 use teloxide::net::Download;
 use std::path::Path;
 
-// Imports for Base64 encoding and inline editing
-use base64::{engine::general_purpose, Engine as _};
+// Imports for computer vision and inline editing.
+// Note: `base64` is no longer needed for the core edit logic but is harmless to keep as a dependency.
 use image::io::Reader as ImageReader;
 use imageproc::{contours::{find_contours, Contour}, rect::Rect};
 
@@ -80,23 +80,14 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
     let output_path = temp_dir_path.join("output.mp4");
     let frame_path = temp_dir_path.join("frame.png");
 
-    let Ok(file) = bot.get_file(&file_id).await else {
-        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not get video file info.").await.ok();
-        return
-    };
-    let Ok(mut dest) = fs::File::create(&input_path).await else {
-        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not create temporary file.").await.ok();
-        return
-    };
-    if bot.download_file(&file.path, &mut dest).await.is_err() {
-        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Failed to download video.").await.ok();
-        return
-    };
+    let Ok(file) = bot.get_file(&file_id).await else { return };
+    let Ok(mut dest) = fs::File::create(&input_path).await else { return };
+    if bot.download_file(&file.path, &mut dest).await.is_err() { return };
 
     let frame_extraction_status = tokio::process::Command::new("ffmpeg")
         .arg("-i").arg(&input_path).arg("-vframes").arg("1").arg(&frame_path).status().await.ok();
     if frame_extraction_status.is_none() || !frame_extraction_status.unwrap().success() {
-        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Failed to extract frame from video.").await.ok();
+        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Failed to extract frame.").await.ok();
         return;
     }
 
@@ -125,16 +116,12 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
             Ok(msg) => msg,
             Err(_) => { bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not pre-upload video.").await.ok(); return; }
         };
-
         let new_video_file_id = match temp_message.video() {
             Some(vid) => vid.file.id.clone(),
             None => { bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not get new file_id.").await.ok(); return; }
         };
-
         bot.delete_message(user_id, temp_message.id).await.ok();
-
         let media = InputMedia::Video(InputMediaVideo::new(InputFile::file_id(new_video_file_id)));
-
         if bot.edit_message_media_inline(&inline_message_id, media).await.is_err() {
             log::warn!("Failed to edit inline message with video. It might have been deleted.");
         }
@@ -142,7 +129,6 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         bot.edit_message_text_inline(&inline_message_id, "❌ An error occurred during video processing.").await.ok();
     }
 }
-
 
 // --- Bot Handlers ---
 
@@ -163,89 +149,80 @@ async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState)
 }
 
 async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool: SharedState) -> Result<(), teloxide::RequestError> {
-    let Some(inline_message_id) = chosen.inline_message_id else {
-        log::warn!("ChosenInlineResult is missing an inline_message_id. This shouldn't happen.");
-        return Ok(());
-    };
+    let Some(inline_message_id) = chosen.inline_message_id else { return Ok(()) };
 
-    if let Some(payload) = chosen.result_id.strip_prefix("edit_") {
-        if let Some((file_id_prefix, b64_text)) = payload.rsplit_once('_') {
-            let pattern = format!("{}%", file_id_prefix);
+    if let Some(file_id_prefix) = chosen.result_id.strip_prefix("edit_") {
+        let pattern = format!("{}%", file_id_prefix);
 
-            if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE file_id LIKE ?")
-                .bind(pattern).fetch_optional(&pool).await.unwrap_or(None) {
+        if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE file_id LIKE ?")
+            .bind(pattern).fetch_optional(&pool).await.unwrap_or(None) {
 
-                if let Ok(text_bytes) = general_purpose::STANDARD.decode(b64_text) {
-                    if let Ok(new_text) = String::from_utf8(text_bytes) {
-                        let user_id = chosen.from.id;
-                        tokio::spawn(perform_video_edit(
-                            bot.clone(),
-                            user_id,
-                            inline_message_id,
-                            video.file_id,
-                            new_text,
-                        ));
+            if let Some((_, edit_params_raw)) = chosen.query.split_once("/edit") {
+                let edit_params = edit_params_raw.trim();
+                let mut final_edit_text = String::new();
+
+                if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
+                    if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
+                        if time_str.parse::<f64>().is_ok() {
+                            final_edit_text = format!("{} // {} // {}", msg1.trim(), time_str.trim(), msg2.trim());
+                        }
                     }
                 }
+                if final_edit_text.is_empty() {
+                    final_edit_text = edit_params.to_string();
+                }
+
+                let user_id = chosen.from.id;
+                tokio::spawn(perform_video_edit(
+                    bot.clone(),
+                    user_id,
+                    inline_message_id,
+                    video.file_id,
+                    final_edit_text,
+                ));
             }
         }
     }
     Ok(())
 }
 
-// MODIFIED: This function now contains the new, more advanced parsing logic for time-based edits.
 async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Result<(), teloxide::RequestError> {
     let mut results = vec![];
 
     if let Some((search_term, edit_params_raw)) = q.query.split_once("/edit") {
         let edit_params = edit_params_raw.trim();
-        let mut final_edit_text = String::new();
         let mut display_description = String::new();
 
-        // --- NEW Parsing Logic ---
-        // Try to parse the format: `message1 /time message2`
         if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
             if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
                 if let Ok(time) = time_str.parse::<f64>() {
-                    // It's a valid time-based edit
-                    let final_msg1 = msg1.trim();
-                    let final_msg2 = msg2.trim();
-                    final_edit_text = format!("{} // {} // {}", final_msg1, time, final_msg2);
-                    display_description = format!("TEXT 1: '{}' | TEXT 2: '{}' (at {}s)", final_msg1, final_msg2, time);
+                    display_description = format!("TEXT 1: '{}' | TEXT 2: '{}' (at {}s)", msg1.trim(), msg2.trim(), time);
                 }
             }
         }
-
-        // If the parsing logic above didn't produce a result, it's a single-message edit.
-        if final_edit_text.is_empty() {
-            final_edit_text = edit_params.to_string();
+        if display_description.is_empty() {
             display_description = format!("Click to replace text with: '{}'", edit_params);
         }
-        // --- End of NEW Parsing Logic ---
 
         let search_pattern = format!("%{}%", search_term.trim());
         if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ?")
             .bind(search_pattern).fetch_optional(&pool).await.unwrap_or(None) {
 
-                let b64_text = general_purpose::STANDARD.encode(&final_edit_text);
-
                 let mut file_id_prefix = video.file_id.clone();
-                file_id_prefix.truncate(30);
-                let result_id = format!("edit_{}_{}", file_id_prefix, b64_text);
+                file_id_prefix.truncate(55);
+                let result_id = format!("edit_{}", file_id_prefix);
 
-                if result_id.len() <= 64 {
-                    let dummy_keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]]);
+                let dummy_keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]]);
 
-                    let result = InlineQueryResult::CachedVideo(
-                        InlineQueryResultCachedVideo::new(result_id, video.file_id, format!("EDIT: {}", video.caption))
-                        .description(display_description)
-                        .input_message_content(InputMessageContent::Text(
-                            InputMessageContentText::new("⚙️ Preparing your video...")
-                        ))
-                        .reply_markup(dummy_keyboard)
-                    );
-                    results.push(result);
-                }
+                let result = InlineQueryResult::CachedVideo(
+                    InlineQueryResultCachedVideo::new(result_id, video.file_id, format!("EDIT: {}", video.caption))
+                    .description(display_description)
+                    .input_message_content(InputMessageContent::Text(
+                        InputMessageContentText::new("⚙️ Preparing your video...")
+                    ))
+                    .reply_markup(dummy_keyboard)
+                );
+                results.push(result);
             }
     } else {
         let videos: Vec<VideoData> = if q.query.is_empty() { sqlx::query_as("SELECT file_id, caption FROM videos").fetch_all(&pool).await.unwrap_or_default()
