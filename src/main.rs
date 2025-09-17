@@ -66,8 +66,6 @@ async fn handle_command(
 
             let mut keyboard_buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
             for video in videos.iter() {
-                // MODIFIED: Truncate the file_id to fit within the 64-byte limit.
-                // We take the first 50 characters, which is safe and unique enough.
                 let mut short_file_id = video.file_id.clone();
                 short_file_id.truncate(50);
 
@@ -95,8 +93,6 @@ async fn handle_callback_query(
     state: SharedState,
 ) -> Result<(), teloxide::RequestError> {
     if let Some(data) = q.data {
-        // MODIFIED: We look for a prefix "delete_" and then use the rest of the data
-        // to find a file_id that STARTS WITH that prefix.
         if let Some(file_id_prefix_to_delete) = data.strip_prefix("delete_") {
             let mut videos = state.lock().await;
             let mut caption_of_deleted = String::new();
@@ -104,9 +100,9 @@ async fn handle_callback_query(
             videos.retain(|video| {
                 if video.file_id.starts_with(file_id_prefix_to_delete) {
                     caption_of_deleted = video.caption.clone();
-                    false // Do not keep this element (i.e., delete it)
+                    false
                 } else {
-                    true // Keep this element
+                    true
                 }
             });
 
@@ -130,13 +126,34 @@ async fn handle_callback_query(
     Ok(())
 }
 
-/// Handler for regular messages to save videos.
+/// MODIFIED: Handler for regular messages to save videos.
+/// Now supports both direct sends and replies.
 async fn handle_message(
     bot: Bot,
     msg: Message,
     state: SharedState,
 ) -> Result<(), teloxide::RequestError> {
+    // We create optional variables to hold the video and caption.
+    // This allows us to handle both saving methods with a single block of code.
+    let mut video_to_save: Option<&Video> = None;
+    let mut caption_to_save: Option<&str> = None;
+
+    // --- CASE 1: User sends a video with a caption directly. ---
     if let (Some(video), Some(caption)) = (msg.video(), msg.caption()) {
+        video_to_save = Some(video);
+        caption_to_save = Some(caption);
+    }
+    // --- CASE 2: User replies to a video with text as the caption. ---
+    else if let (Some(reply), Some(caption)) = (msg.reply_to_message(), msg.text()) {
+        // Check if the replied-to message actually contains a video.
+        if let Some(video) = reply.video() {
+            video_to_save = Some(video);
+            caption_to_save = Some(caption);
+        }
+    }
+
+    // --- SAVE LOGIC: Runs if either of the above cases was successful. ---
+    if let (Some(video), Some(caption)) = (video_to_save, caption_to_save) {
         let mut videos = state.lock().await;
         let new_video_data = VideoData {
             caption: caption.to_string(),
@@ -144,16 +161,24 @@ async fn handle_message(
         };
         log::info!("Storing new video: {:?}", new_video_data);
         videos.push(new_video_data);
+
+        // Confirm to the user that the video has been saved.
         bot.send_message(msg.chat.id, "✅ Video and caption saved successfully!")
             .reply_to_message_id(msg.id)
             .await?;
-    } else {
+    }
+    // --- FALLBACK: If no valid action was detected, send help text. ---
+    else {
         bot.send_message(
             msg.chat.id,
-            "Please send me a video with a caption to save it. Use /help to see available commands.",
+            "To save a video, either:\n\
+            1. Send a video with a caption.\n\
+            2. Reply to a video with the caption you want to use.\n\n\
+            Use /help to see other commands.",
         )
         .await?;
     }
+
     Ok(())
 }
 
