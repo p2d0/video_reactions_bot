@@ -121,25 +121,20 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         .arg("-map").arg("[v]").arg("-map").arg("0:a?").arg("-c:a").arg("copy").arg(&output_path);
 
     if command.status().await.is_ok_and(|s| s.success()) {
-        // 1. Upload the new video to the user's private chat to get a file_id.
         let temp_message = match bot.send_video(user_id, InputFile::file(&output_path)).await {
             Ok(msg) => msg,
             Err(_) => { bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not pre-upload video.").await.ok(); return; }
         };
 
-        // 2. Extract the new file_id.
         let new_video_file_id = match temp_message.video() {
             Some(vid) => vid.file.id.clone(),
             None => { bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not get new file_id.").await.ok(); return; }
         };
 
-        // 3. Clean up the temporary message.
         bot.delete_message(user_id, temp_message.id).await.ok();
 
-        // 4. Create the final media object using the NEW file_id.
         let media = InputMedia::Video(InputMediaVideo::new(InputFile::file_id(new_video_file_id)));
 
-        // 5. Edit the original inline message. This is now allowed.
         if bot.edit_message_media_inline(&inline_message_id, media).await.is_err() {
             log::warn!("Failed to edit inline message with video. It might have been deleted.");
         }
@@ -169,7 +164,7 @@ async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState)
 
 async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool: SharedState) -> Result<(), teloxide::RequestError> {
     let Some(inline_message_id) = chosen.inline_message_id else {
-        log::warn!("ChosenInlineResult is missing an inline_message_id. This shouldn't happen with the new keyboard fix.");
+        log::warn!("ChosenInlineResult is missing an inline_message_id. This shouldn't happen.");
         return Ok(());
     };
 
@@ -198,29 +193,52 @@ async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool:
     Ok(())
 }
 
+// MODIFIED: This function now contains the new, more advanced parsing logic for time-based edits.
 async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Result<(), teloxide::RequestError> {
     let mut results = vec![];
 
-    if let Some((search_term, new_text)) = q.query.split_once("/edit") {
+    if let Some((search_term, edit_params_raw)) = q.query.split_once("/edit") {
+        let edit_params = edit_params_raw.trim();
+        let mut final_edit_text = String::new();
+        let mut display_description = String::new();
+
+        // --- NEW Parsing Logic ---
+        // Try to parse the format: `message1 /time message2`
+        if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
+            if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
+                if let Ok(time) = time_str.parse::<f64>() {
+                    // It's a valid time-based edit
+                    let final_msg1 = msg1.trim();
+                    let final_msg2 = msg2.trim();
+                    final_edit_text = format!("{} // {} // {}", final_msg1, time, final_msg2);
+                    display_description = format!("TEXT 1: '{}' | TEXT 2: '{}' (at {}s)", final_msg1, final_msg2, time);
+                }
+            }
+        }
+
+        // If the parsing logic above didn't produce a result, it's a single-message edit.
+        if final_edit_text.is_empty() {
+            final_edit_text = edit_params.to_string();
+            display_description = format!("Click to replace text with: '{}'", edit_params);
+        }
+        // --- End of NEW Parsing Logic ---
+
         let search_pattern = format!("%{}%", search_term.trim());
         if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ?")
             .bind(search_pattern).fetch_optional(&pool).await.unwrap_or(None) {
 
-                let trimmed_new_text = new_text.trim();
-                let b64_text = general_purpose::STANDARD.encode(trimmed_new_text);
+                let b64_text = general_purpose::STANDARD.encode(&final_edit_text);
 
                 let mut file_id_prefix = video.file_id.clone();
                 file_id_prefix.truncate(30);
                 let result_id = format!("edit_{}_{}", file_id_prefix, b64_text);
 
                 if result_id.len() <= 64 {
-                    let dummy_keyboard = InlineKeyboardMarkup::new(vec![
-                        vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]
-                    ]);
+                    let dummy_keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]]);
 
                     let result = InlineQueryResult::CachedVideo(
                         InlineQueryResultCachedVideo::new(result_id, video.file_id, format!("EDIT: {}", video.caption))
-                        .description(format!("Click to replace text with: '{}'", trimmed_new_text))
+                        .description(display_description)
                         .input_message_content(InputMessageContent::Text(
                             InputMessageContentText::new("⚙️ Preparing your video...")
                         ))
