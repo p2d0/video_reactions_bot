@@ -126,15 +126,12 @@ async fn handle_callback_query(
     Ok(())
 }
 
-/// MODIFIED: Handler for regular messages to save videos.
-/// Now supports both direct sends and replies.
+/// Handler for regular messages to save videos.
 async fn handle_message(
     bot: Bot,
     msg: Message,
     state: SharedState,
 ) -> Result<(), teloxide::RequestError> {
-    // We create optional variables to hold the video and caption.
-    // This allows us to handle both saving methods with a single block of code.
     let mut video_to_save: Option<&Video> = None;
     let mut caption_to_save: Option<&str> = None;
 
@@ -145,14 +142,12 @@ async fn handle_message(
     }
     // --- CASE 2: User replies to a video with text as the caption. ---
     else if let (Some(reply), Some(caption)) = (msg.reply_to_message(), msg.text()) {
-        // Check if the replied-to message actually contains a video.
         if let Some(video) = reply.video() {
             video_to_save = Some(video);
             caption_to_save = Some(caption);
         }
     }
 
-    // --- SAVE LOGIC: Runs if either of the above cases was successful. ---
     if let (Some(video), Some(caption)) = (video_to_save, caption_to_save) {
         let mut videos = state.lock().await;
         let new_video_data = VideoData {
@@ -161,13 +156,10 @@ async fn handle_message(
         };
         log::info!("Storing new video: {:?}", new_video_data);
         videos.push(new_video_data);
-
-        // Confirm to the user that the video has been saved.
         bot.send_message(msg.chat.id, "✅ Video and caption saved successfully!")
             .reply_to_message_id(msg.id)
             .await?;
     }
-    // --- FALLBACK: If no valid action was detected, send help text. ---
     else {
         bot.send_message(
             msg.chat.id,
@@ -178,11 +170,11 @@ async fn handle_message(
         )
         .await?;
     }
-
     Ok(())
 }
 
-/// Handler for inline queries.
+/// MODIFIED: Handler for inline queries.
+/// Now shows all videos if the search query is empty.
 async fn handle_inline_query(
     bot: Bot,
     q: InlineQuery,
@@ -195,7 +187,10 @@ async fn handle_inline_query(
     let results: Vec<InlineQueryResult> = videos
         .iter()
         .filter(|video| {
-            video.caption.to_lowercase().contains(&query_text.to_lowercase())
+            // If the query is empty, the first part of the 'or' is true,
+            // so all videos are included. Otherwise, it falls back to the search.
+            query_text.is_empty()
+                || video.caption.to_lowercase().contains(&query_text.to_lowercase())
         })
         .enumerate()
         .map(|(i, video)| {
