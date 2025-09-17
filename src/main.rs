@@ -4,9 +4,9 @@ use tempfile::Builder;
 use tokio::fs;
 use teloxide::net::Download;
 use std::path::Path;
+use std::cmp::Reverse;
 
 // Imports for computer vision and inline editing.
-// Note: `base64` is no longer needed for the core edit logic but is harmless to keep as a dependency.
 use image::io::Reader as ImageReader;
 use imageproc::{contours::{find_contours, Contour}, rect::Rect};
 
@@ -29,21 +29,30 @@ enum Command {
 #[derive(Debug, Clone, Copy)]
 struct BoundingBox { x: i32, y: i32, w: u32, h: u32 }
 
-fn detect_white_box(image_path: &Path) -> Option<BoundingBox> {
-    let img = ImageReader::open(image_path).ok()?.decode().ok()?;
+fn detect_white_boxes(image_path: &Path) -> Vec<BoundingBox> {
+    let Some(img) = ImageReader::open(image_path).ok().and_then(|r| r.decode().ok()) else { return vec![]; };
+
     let gray_image = imageproc::map::map_pixels(&img.to_rgb8(), |_, _, p| {
         if p[0] > 240 && p[1] > 240 && p[2] > 240 { image::Luma([255]) } else { image::Luma([0]) }
     });
+
     let contours: Vec<Contour<i32>> = find_contours(&gray_image);
-    let largest_box = contours.iter().filter(|c| !c.points.is_empty()).map(|contour| {
+
+    let mut boxes: Vec<Rect> = contours.iter().filter(|c| !c.points.is_empty()).map(|contour| {
         let mut min_x = i32::MAX; let mut min_y = i32::MAX; let mut max_x = i32::MIN; let mut max_y = i32::MIN;
         for point in &contour.points {
             min_x = min_x.min(point.x); min_y = min_y.min(point.y); max_x = max_x.max(point.x); max_y = max_y.max(point.y);
         }
         Rect::at(min_x, min_y).of_size((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32)
-    }).filter(|rect| rect.width() > 50 && rect.height() > 20).max_by_key(|rect| rect.width() * rect.height());
-    largest_box.map(|rect| BoundingBox { x: rect.left(), y: rect.top(), w: rect.width(), h: rect.height() })
+    }).filter(|rect| rect.width() > 50 && rect.height() > 50).collect();
+
+    boxes.sort_by_key(|b| Reverse(b.width() * b.height()));
+
+    boxes.into_iter().take(2).map(|rect| BoundingBox {
+        x: rect.left(), y: rect.top(), w: rect.width(), h: rect.height(),
+    }).collect()
 }
+
 
 // --- Main Bot Logic ---
 
@@ -91,44 +100,63 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         return;
     }
 
-    let detected_box = detect_white_box(&frame_path);
-    let (box_x, box_y, box_w, box_h) = match detected_box {
-        Some(b) => (b.x.to_string(), b.y.to_string(), b.w.to_string(), b.h.to_string()),
-        None => ("0".to_string(), "0".to_string(), "iw".to_string(), "150".to_string()),
-    };
+    let detected_boxes = detect_white_boxes(&frame_path);
+    if detected_boxes.is_empty() {
+        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not detect any text boxes in the video.").await.ok();
+        return;
+    }
 
+    let messages: Vec<&str> = text_parts.split("///").collect();
     let font_path = std::env::var("FONT_PATH").expect("FONT_PATH must be set in .env");
-    let parts: Vec<&str> = text_parts.split("//").map(|s| s.trim()).collect();
-    let filter_complex = if parts.len() == 3 {
-        format!("[0:v]drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill, drawtext=fontfile='{font}':text='{t1}':fontcolor=black:fontsize=48:x={x}+(({w}-text_w)/2):y={y}+(({h}-text_h)/2):enable='lt(t,{ts})', drawtext=fontfile='{font}':text='{t2}':fontcolor=black:fontsize=48:x={x}+(({w}-text_w)/2):y={y}+(({h}-text_h)/2):enable='gte(t,{ts})'[v]",
-            font=font_path, t1=parts[0].replace('\'',r"\'"), t2=parts[2].replace('\'',r"\'"), ts=parts[1], x=box_x, y=box_y, w=box_w, h=box_h)
-    } else {
-        format!("[0:v]drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill, drawtext=fontfile='{font}':text='{txt}':fontcolor=black:fontsize=48:x={x}+(({w}-text_w)/2):y={y}+(({h}-text_h)/2)[v]",
-            font=font_path, txt=text_parts.replace('\'',r"\'"), x=box_x, y=box_y, w=box_w, h=box_h)
-    };
+
+    // FIXED: `last_tag` is now an owned `String` to solve the lifetime error.
+    let mut filter_chain = String::new();
+    let mut last_tag = String::from("[0:v]");
+
+    for (i, bbox) in detected_boxes.iter().enumerate() {
+        let text_to_draw = messages.get(i).unwrap_or(&messages[0]).trim();
+        let sanitized_text = text_to_draw.replace('\'', r"\'");
+        let current_tag = format!("[v{}]", i);
+
+        let new_filter_part = format!(
+            "{last_tag}drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill, \
+             drawtext=fontfile='{font}':text='{txt}':fontcolor=black:fontsize=48:x={x}+(({w}-text_w)/2):y={y}+(({h}-text_h)/2){out}",
+            last_tag = last_tag,
+            x=bbox.x, y=bbox.y, w=bbox.w, h=bbox.h,
+            font=font_path,
+            txt=sanitized_text,
+            out=&current_tag
+        );
+
+        if i > 0 {
+            filter_chain.push(';');
+        }
+        filter_chain.push_str(&new_filter_part);
+
+        // `last_tag` takes ownership of the new tag for the next iteration.
+        last_tag = current_tag;
+    }
 
     let mut command = tokio::process::Command::new("ffmpeg");
-    command.arg("-i").arg(&input_path).arg("-filter_complex").arg(filter_complex)
-        .arg("-map").arg("[v]").arg("-map").arg("0:a?").arg("-c:a").arg("copy").arg(&output_path);
+    command.arg("-i").arg(&input_path).arg("-filter_complex").arg(&filter_chain)
+        .arg("-map").arg(&last_tag).arg("-map").arg("0:a?").arg("-c:a").arg("copy").arg(&output_path);
 
     if command.status().await.is_ok_and(|s| s.success()) {
         let temp_message = match bot.send_video(user_id, InputFile::file(&output_path)).await {
             Ok(msg) => msg,
             Err(_) => { bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not pre-upload video.").await.ok(); return; }
         };
-        let new_video_file_id = match temp_message.video() {
-            Some(vid) => vid.file.id.clone(),
-            None => { bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not get new file_id.").await.ok(); return; }
-        };
+        let new_video_file_id = match temp_message.video() { Some(vid) => vid.file.id.clone(), None => return };
         bot.delete_message(user_id, temp_message.id).await.ok();
         let media = InputMedia::Video(InputMediaVideo::new(InputFile::file_id(new_video_file_id)));
         if bot.edit_message_media_inline(&inline_message_id, media).await.is_err() {
-            log::warn!("Failed to edit inline message with video. It might have been deleted.");
+            log::warn!("Failed to edit inline message.");
         }
     } else {
         bot.edit_message_text_inline(&inline_message_id, "❌ An error occurred during video processing.").await.ok();
     }
 }
+
 
 // --- Bot Handlers ---
 
@@ -153,24 +181,16 @@ async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool:
 
     if let Some(file_id_prefix) = chosen.result_id.strip_prefix("edit_") {
         let pattern = format!("{}%", file_id_prefix);
-
         if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE file_id LIKE ?")
             .bind(pattern).fetch_optional(&pool).await.unwrap_or(None) {
 
             if let Some((_, edit_params_raw)) = chosen.query.split_once("/edit") {
                 let edit_params = edit_params_raw.trim();
-                let mut final_edit_text = String::new();
-
-                if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
-                    if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
-                        if time_str.parse::<f64>().is_ok() {
-                            final_edit_text = format!("{} // {} // {}", msg1.trim(), time_str.trim(), msg2.trim());
-                        }
-                    }
-                }
-                if final_edit_text.is_empty() {
-                    final_edit_text = edit_params.to_string();
-                }
+                let final_edit_text = if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
+                    format!("{}///{}", msg1.trim(), msg2.trim())
+                } else {
+                    edit_params.to_string()
+                };
 
                 let user_id = chosen.from.id;
                 tokio::spawn(perform_video_edit(
@@ -191,18 +211,11 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
 
     if let Some((search_term, edit_params_raw)) = q.query.split_once("/edit") {
         let edit_params = edit_params_raw.trim();
-        let mut display_description = String::new();
-
-        if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
-            if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
-                if let Ok(time) = time_str.parse::<f64>() {
-                    display_description = format!("TEXT 1: '{}' | TEXT 2: '{}' (at {}s)", msg1.trim(), msg2.trim(), time);
-                }
-            }
-        }
-        if display_description.is_empty() {
-            display_description = format!("Click to replace text with: '{}'", edit_params);
-        }
+        let display_description = if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
+            format!("BOX 1: '{}' | BOX 2: '{}'", msg1.trim(), msg2.trim())
+        } else {
+            format!("Click to replace text with: '{}'", edit_params)
+        };
 
         let search_pattern = format!("%{}%", search_term.trim());
         if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ?")
@@ -217,9 +230,7 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
                 let result = InlineQueryResult::CachedVideo(
                     InlineQueryResultCachedVideo::new(result_id, video.file_id, format!("EDIT: {}", video.caption))
                     .description(display_description)
-                    .input_message_content(InputMessageContent::Text(
-                        InputMessageContentText::new("⚙️ Preparing your video...")
-                    ))
+                    .input_message_content(InputMessageContent::Text(InputMessageContentText::new("⚙️ Preparing your video...")))
                     .reply_markup(dummy_keyboard)
                 );
                 results.push(result);
