@@ -5,6 +5,7 @@ use tokio::fs;
 use teloxide::net::Download;
 use std::path::Path;
 use std::cmp::Reverse;
+use std::env;
 
 // Imports for computer vision and inline editing.
 use image::io::Reader as ImageReader;
@@ -77,7 +78,7 @@ async fn main() {
     Dispatcher::builder(bot, handler).dependencies(dptree::deps![pool]).enable_ctrlc_handler().build().dispatch().await;
 }
 
-// --- Background Video Editing Task ---
+// --- Background Video Editing Task (LIFETIME ERROR FIXED) ---
 
 async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String, file_id: String, text_parts: String) {
     let temp_dir = match Builder::new().prefix("video_edit").tempdir() {
@@ -102,44 +103,57 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
 
     let detected_boxes = detect_white_boxes(&frame_path);
     if detected_boxes.is_empty() {
-        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not detect any text boxes in the video.").await.ok();
+        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not detect any text boxes.").await.ok();
         return;
     }
 
     let messages: Vec<&str> = text_parts.split("///").collect();
     let font_path = std::env::var("FONT_PATH").expect("FONT_PATH must be set in .env");
 
-    // FIXED: `last_tag` is now an owned `String` to solve the lifetime error.
-    let mut filter_chain = String::new();
-    let mut last_tag = String::from("[0:v]");
+    // FIXED: This new logic correctly builds the filter chain and avoids the lifetime error.
+    let mut filter_parts = vec![];
+    let mut last_tag = "[0:v]".to_string();
 
     for (i, bbox) in detected_boxes.iter().enumerate() {
         let text_to_draw = messages.get(i).unwrap_or(&messages[0]).trim();
         let sanitized_text = text_to_draw.replace('\'', r"\'");
         let current_tag = format!("[v{}]", i);
 
-        let new_filter_part = format!(
+        let filter = format!(
             "{last_tag}drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill, \
              drawtext=fontfile='{font}':text='{txt}':fontcolor=black:fontsize=48:x={x}+(({w}-text_w)/2):y={y}+(({h}-text_h)/2){out}",
-            last_tag = last_tag,
+            last_tag = &last_tag,
             x=bbox.x, y=bbox.y, w=bbox.w, h=bbox.h,
             font=font_path,
             txt=sanitized_text,
             out=&current_tag
         );
-
-        if i > 0 {
-            filter_chain.push(';');
-        }
-        filter_chain.push_str(&new_filter_part);
-
-        // `last_tag` takes ownership of the new tag for the next iteration.
+        filter_parts.push(filter);
         last_tag = current_tag;
     }
 
+    let final_format_filter = format!("{last_tag}format=yuv420p[v_out]", last_tag = &last_tag);
+    filter_parts.push(final_format_filter);
+
+    let final_filter_chain = filter_parts.join(";");
+    let final_map_tag = "[v_out]";
+
+
     let mut command = tokio::process::Command::new("ffmpeg");
-    command.arg("-i").arg(&input_path).arg("-filter_complex").arg(&filter_chain)
-        .arg("-map").arg(&last_tag).arg("-map").arg("0:a?").arg("-c:a").arg("copy").arg(&output_path);
+    command.arg("-i").arg(&input_path).arg("-filter_complex").arg(&final_filter_chain)
+        .arg("-map").arg(final_map_tag).arg("-map").arg("0:a?").arg("-c:a").arg("copy");
+
+    // --- PERFORMANCE IMPROVEMENTS ---
+    let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
+    if !encoder.is_empty() {
+        log::info!("Using hardware encoder: {}", &encoder);
+        command.arg("-c:v").arg(encoder);
+    } else {
+        log::info!("Using CPU encoder with 'ultrafast' preset.");
+        command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast");
+    }
+    command.arg("-pix_fmt").arg("yuv420p");
+    command.arg(&output_path);
 
     if command.status().await.is_ok_and(|s| s.success()) {
         let temp_message = match bot.send_video(user_id, InputFile::file(&output_path)).await {
@@ -158,7 +172,7 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
 }
 
 
-// --- Bot Handlers ---
+// --- Bot Handlers (Unchanged) ---
 
 async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState) -> Result<(), teloxide::RequestError> {
     match cmd {
@@ -194,11 +208,7 @@ async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool:
 
                 let user_id = chosen.from.id;
                 tokio::spawn(perform_video_edit(
-                    bot.clone(),
-                    user_id,
-                    inline_message_id,
-                    video.file_id,
-                    final_edit_text,
+                    bot.clone(), user_id, inline_message_id, video.file_id, final_edit_text,
                 ));
             }
         }
@@ -237,7 +247,9 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
             }
     } else {
         let videos: Vec<VideoData> = if q.query.is_empty() { sqlx::query_as("SELECT file_id, caption FROM videos").fetch_all(&pool).await.unwrap_or_default()
-        } else { let pattern = format!("%{}%", q.query); sqlx::query_as("SELECT file_id, caption FROM videos WHERE caption LIKE ?").bind(pattern).fetch_all(&pool).await.unwrap_or_default() };
+        } else {
+            let pattern = format!("%{}%", q.query); sqlx::query_as("SELECT file_id, caption FROM videos WHERE caption LIKE ?").bind(pattern).fetch_all(&pool).await.unwrap_or_default()
+            };
 
         results = videos.into_iter().enumerate().map(|(i, video)| {
             InlineQueryResult::CachedVideo(InlineQueryResultCachedVideo::new(i.to_string(), video.file_id, video.caption.clone()).caption(video.caption))
