@@ -30,19 +30,19 @@ enum Command {
 #[derive(Debug, Clone, Copy)]
 struct BoundingBox { x: i32, y: i32, w: u32, h: u32 }
 
-fn detect_white_boxes(image_path: &Path) -> Vec<BoundingBox> {
+// MODIFIED: This function now detects white boxes, and if none are found, falls back to detecting black boxes.
+fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     let Some(img) = ImageReader::open(image_path).ok().and_then(|r| r.decode().ok()) else { return vec![]; };
 
     // First, convert the whole image to grayscale
     let gray_image = img.to_luma8();
 
-    // Then, apply a threshold to the grayscale values
-    let binary_image = imageproc::map::map_pixels(&gray_image, |_, _, p| {
+    // --- 1. Attempt to find WHITE boxes ---
+    let white_binary_image = imageproc::map::map_pixels(&gray_image, |_, _, p| {
         if p[0] > 250 { image::Luma([255]) } else { image::Luma([0]) }
     });
 
-    // Now find contours on this new binary_image
-    let contours: Vec<Contour<i32>> = find_contours(&binary_image);
+    let contours: Vec<Contour<i32>> = find_contours(&white_binary_image);
 
     let mut boxes: Vec<Rect> = contours.iter().filter(|c| !c.points.is_empty()).map(|contour| {
         let mut min_x = i32::MAX; let mut min_y = i32::MAX; let mut max_x = i32::MIN; let mut max_y = i32::MIN;
@@ -52,6 +52,25 @@ fn detect_white_boxes(image_path: &Path) -> Vec<BoundingBox> {
         Rect::at(min_x, min_y).of_size((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32)
     }).filter(|rect| rect.width() > 50 && rect.height() > 50).collect();
 
+    // --- 2. If no white boxes were found, search for BLACK boxes ---
+    if boxes.is_empty() {
+        // Apply a threshold to find very dark regions, making them white for contour detection.
+        let black_binary_image = imageproc::map::map_pixels(&gray_image, |_, _, p| {
+            if p[0] < 1 { image::Luma([255]) } else { image::Luma([0]) }
+        });
+
+        let black_contours: Vec<Contour<i32>> = find_contours(&black_binary_image);
+
+        boxes = black_contours.iter().filter(|c| !c.points.is_empty()).map(|contour| {
+            let mut min_x = i32::MAX; let mut min_y = i32::MAX; let mut max_x = i32::MIN; let mut max_y = i32::MIN;
+            for point in &contour.points {
+                min_x = min_x.min(point.x); min_y = min_y.min(point.y); max_x = max_x.max(point.x); max_y = max_y.max(point.y);
+            }
+            Rect::at(min_x, min_y).of_size((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32)
+        }).filter(|rect| rect.width() > 50 && rect.height() > 50).collect();
+    }
+
+    // --- 3. Sort and take the largest 2 boxes found (either white or black) ---
     boxes.sort_by_key(|b| Reverse(b.width() * b.height()));
 
     boxes.into_iter().take(2).map(|rect| BoundingBox {
@@ -83,7 +102,7 @@ async fn main() {
     Dispatcher::builder(bot, handler).dependencies(dptree::deps![pool]).enable_ctrlc_handler().build().dispatch().await;
 }
 
-// --- Background Video Editing Task (LIFETIME ERROR FIXED) ---
+// --- Background Video Editing Task ---
 
 async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String, file_id: String, text_parts: String) {
     let temp_dir = match Builder::new().prefix("video_edit").tempdir() {
@@ -106,7 +125,8 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         return;
     }
 
-    let detected_boxes = detect_white_boxes(&frame_path);
+    // UPDATED: Changed the function call to the new, more capable one.
+    let detected_boxes = detect_white_or_black_boxes(&frame_path);
     if detected_boxes.is_empty() {
         bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not detect any text boxes.").await.ok();
         return;
@@ -115,10 +135,8 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
     let messages: Vec<&str> = text_parts.split("///").collect();
     let font_path = std::env::var("FONT_PATH").expect("FONT_PATH must be set in .env");
 
-    // FIXED: This new logic correctly builds the filter chain and avoids the lifetime error.
     let mut filter_parts = vec![];
     let mut last_tag = "[0:v]".to_string();
-
     let boxes_to_edit = detected_boxes.iter().take(messages.len());
 
     for (i, bbox) in boxes_to_edit.enumerate() {
@@ -159,9 +177,9 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         log::info!("Using NVIDIA CUDA encoder: h264_nvenc");
         command
             .arg("-c:v").arg("h264_nvenc")
-            .arg("-preset").arg("p7")  // Fastest preset for NVENC
-            .arg("-rc").arg("vbr")     // Variable bitrate for quality
-            .arg("-gpu").arg("0");     // Use first available GPU
+            .arg("-preset").arg("p7")
+            .arg("-rc").arg("vbr")
+            .arg("-gpu").arg("0");
     } else {
         log::info!("Using CPU encoder with 'ultrafast' preset.");
         command
@@ -169,9 +187,6 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
             .arg("-preset").arg("ultrafast");
     }
     command
-        // .arg("-crf").arg("30")
-        // .arg("-maxrate").arg("1M")
-        // .arg("-profile:v").arg("baseline")
         .arg("-flags").arg("+global_header")
         .arg("-movflags").arg("+faststart")
         .arg("-pix_fmt").arg("yuv420p")
