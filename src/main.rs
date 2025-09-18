@@ -33,11 +33,16 @@ struct BoundingBox { x: i32, y: i32, w: u32, h: u32 }
 fn detect_white_boxes(image_path: &Path) -> Vec<BoundingBox> {
     let Some(img) = ImageReader::open(image_path).ok().and_then(|r| r.decode().ok()) else { return vec![]; };
 
-    let gray_image = imageproc::map::map_pixels(&img.to_rgb8(), |_, _, p| {
-        if p[0] > 240 && p[1] > 240 && p[2] > 240 { image::Luma([255]) } else { image::Luma([0]) }
+    // First, convert the whole image to grayscale
+    let gray_image = img.to_luma8();
+
+    // Then, apply a threshold to the grayscale values
+    let binary_image = imageproc::map::map_pixels(&gray_image, |_, _, p| {
+        if p[0] > 250 { image::Luma([255]) } else { image::Luma([0]) }
     });
 
-    let contours: Vec<Contour<i32>> = find_contours(&gray_image);
+    // Now find contours on this new binary_image
+    let contours: Vec<Contour<i32>> = find_contours(&binary_image);
 
     let mut boxes: Vec<Rect> = contours.iter().filter(|c| !c.points.is_empty()).map(|contour| {
         let mut min_x = i32::MAX; let mut min_y = i32::MAX; let mut max_x = i32::MIN; let mut max_y = i32::MIN;
@@ -114,7 +119,9 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
     let mut filter_parts = vec![];
     let mut last_tag = "[0:v]".to_string();
 
-    for (i, bbox) in detected_boxes.iter().enumerate() {
+    let boxes_to_edit = detected_boxes.iter().take(messages.len());
+
+    for (i, bbox) in boxes_to_edit.enumerate() {
         let text_to_draw = messages.get(i).unwrap_or(&messages[0]).trim();
         let sanitized_text = text_to_draw.replace('\'', r"\'");
         let current_tag = format!("[v{}]", i);
