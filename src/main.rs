@@ -254,9 +254,22 @@ async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool:
 }
 
 async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Result<(), teloxide::RequestError> {
+    // --- START OF CHANGES ---
+
+    // 1. Define a page size (Telegram's limit is 50, so we use a safe value like 30).
+    const PAGE_SIZE: i64 = 30;
+
+    // 2. Parse the offset from the inline query. It's a string, so we parse it to a number.
+    // If it's empty or invalid, we default to page 0.
+    let page: i64 = q.offset.parse().unwrap_or(0);
+    let sql_offset = page * PAGE_SIZE;
+
     let mut results = vec![];
 
+    // Check if we are in "edit" mode or normal search mode.
     if let Some((search_term, edit_params_raw)) = q.query.split_once("/edit") {
+        // This part is for editing, which typically should only find one result.
+        // Paging is less critical here, but we'll keep the logic consistent.
         let edit_params = edit_params_raw.trim();
         let display_description = if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
             format!("BOX 1: '{}' | BOX 2: '{}'", msg1.trim(), msg2.trim())
@@ -265,13 +278,13 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
         };
 
         let search_pattern = format!("%{}%", search_term.trim());
-        if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ?")
+        // Fetch only one video for editing.
+        if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ? LIMIT 1")
             .bind(search_pattern).fetch_optional(&pool).await.unwrap_or(None) {
 
                 let mut file_id_prefix = video.file_id.clone();
                 file_id_prefix.truncate(55);
                 let result_id = format!("edit_{}", file_id_prefix);
-
                 let dummy_keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]]);
 
                 let result = InlineQueryResult::CachedVideo(
@@ -283,17 +296,45 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
                 results.push(result);
             }
     } else {
-        let videos: Vec<VideoData> = if q.query.is_empty() { sqlx::query_as("SELECT file_id, caption FROM videos").fetch_all(&pool).await.unwrap_or_default()
+        // This is the normal search mode where paging is essential.
+        // 3. Modify the SQL query to use LIMIT and OFFSET for paging.
+        let videos: Vec<VideoData> = if q.query.is_empty() {
+            sqlx::query_as("SELECT file_id, caption FROM videos LIMIT ? OFFSET ?")
+                .bind(PAGE_SIZE).bind(sql_offset).fetch_all(&pool).await.unwrap_or_default()
         } else {
-            let pattern = format!("%{}%", q.query); sqlx::query_as("SELECT file_id, caption FROM videos WHERE caption LIKE ?").bind(pattern).fetch_all(&pool).await.unwrap_or_default()
-            };
+            let pattern = format!("%{}%", q.query);
+            sqlx::query_as("SELECT file_id, caption FROM videos WHERE caption LIKE ? LIMIT ? OFFSET ?")
+                .bind(pattern).bind(PAGE_SIZE).bind(sql_offset).fetch_all(&pool).await.unwrap_or_default()
+        };
 
         results = videos.into_iter().enumerate().map(|(i, video)| {
-            InlineQueryResult::CachedVideo(InlineQueryResultCachedVideo::new(i.to_string(), video.file_id, video.caption.clone()))
+            // Use a unique ID based on the video file_id instead of enumeration index
+            let mut result_id = video.file_id.clone();
+            result_id.truncate(60); // InlineQueryResult result_id has a 64-byte limit.
+            InlineQueryResult::CachedVideo(InlineQueryResultCachedVideo::new(result_id, video.file_id, video.caption.clone()))
         }).collect();
     }
 
-    bot.answer_inline_query(q.id, results).await?;
+    // 4. Determine the next_offset for the client.
+    let next_offset = if results.len() == PAGE_SIZE as usize {
+        // If we received a full page of results, there might be more.
+        // Set the next_offset to the next page number.
+        Some((page + 1).to_string())
+    } else {
+        // If we received less than a full page, this is the end.
+        // An empty offset tells the client not to request more.
+        None
+    };
+
+    // 5. Send the results back with the next_offset.
+    let mut answer = bot.answer_inline_query(q.id, results);
+    if let Some(offset) = next_offset {
+        answer = answer.next_offset(offset);
+    }
+    answer.await?;
+
+    // --- END OF CHANGES ---
+
     Ok(())
 }
 
