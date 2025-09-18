@@ -154,18 +154,28 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
     let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
     if !encoder.is_empty() {
         log::info!("Using hardware encoder: {}", &encoder);
-        command.arg("-c:v").arg(encoder);
+        command.arg("-c:v").arg(&encoder);
+    } else if env::var("CUDA_ENABLED").is_ok() {
+        log::info!("Using NVIDIA CUDA encoder: h264_nvenc");
+        command
+            .arg("-c:v").arg("h264_nvenc")
+            .arg("-preset").arg("p7")  // Fastest preset for NVENC
+            .arg("-rc").arg("vbr")     // Variable bitrate for quality
+            .arg("-gpu").arg("0");     // Use first available GPU
     } else {
         log::info!("Using CPU encoder with 'ultrafast' preset.");
-        command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast");
+        command
+            .arg("-c:v").arg("libx264")
+            .arg("-preset").arg("ultrafast");
     }
-    command.arg("-crf").arg("30");
-    command.arg("-maxrate").arg("1M");
-    command.arg("-profile:v").arg("baseline");
-    command.arg("-flags").arg("+global_header");
-    command.arg("-movflags").arg("+faststart");
-    command.arg("-pix_fmt").arg("yuv420p");
-    command.arg(&output_path);
+    command
+        // .arg("-crf").arg("30")
+        // .arg("-maxrate").arg("1M")
+        // .arg("-profile:v").arg("baseline")
+        .arg("-flags").arg("+global_header")
+        .arg("-movflags").arg("+faststart")
+        .arg("-pix_fmt").arg("yuv420p")
+        .arg(&output_path);
 
     if command.status().await.is_ok_and(|s| s.success()) {
         let temp_message = match bot.send_video(user_id, InputFile::file(&output_path)).await {
