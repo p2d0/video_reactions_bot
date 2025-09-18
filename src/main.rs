@@ -274,7 +274,7 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
             };
 
         results = videos.into_iter().enumerate().map(|(i, video)| {
-            InlineQueryResult::CachedVideo(InlineQueryResultCachedVideo::new(i.to_string(), video.file_id, video.caption.clone()).caption(video.caption))
+            InlineQueryResult::CachedVideo(InlineQueryResultCachedVideo::new(i.to_string(), video.file_id, video.caption.clone()))
         }).collect();
     }
 
