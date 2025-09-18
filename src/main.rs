@@ -152,6 +152,11 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         log::info!("Using CPU encoder with 'ultrafast' preset.");
         command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast");
     }
+    command.arg("-crf").arg("30");
+    command.arg("-maxrate").arg("1M");
+    command.arg("-profile:v").arg("baseline");
+    command.arg("-flags").arg("+global_header");
+    command.arg("-movflags").arg("+faststart");
     command.arg("-pix_fmt").arg("yuv420p");
     command.arg(&output_path);
 
