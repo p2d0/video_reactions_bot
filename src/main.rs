@@ -488,10 +488,8 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
         } else {
             // --- User has NOT started the bot, show a prompt to start it ---
             let me = bot.get_me().await?;
-            // FIX 1: Access the `username` FIELD, not a method. Use a reference.
             if let Some(bot_username) = &me.username {
                  let start_url_str = format!("https://t.me/{}?start=inline", bot_username);
-                 // FIX 2: Safely parse the string into a reqwest::Url
                  if let Ok(start_url) = Url::parse(&start_url_str) {
                      let keyboard = InlineKeyboardMarkup::new(vec![vec![
                          InlineKeyboardButton::url("Click here to Start Bot", start_url)
@@ -540,6 +538,11 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
     if let Some(offset) = next_offset {
         answer = answer.next_offset(offset);
     }
+
+    if q.query.contains("/edit") {
+        answer = answer.cache_time(0);
+    }
+
     answer.await?;
 
     Ok(())
