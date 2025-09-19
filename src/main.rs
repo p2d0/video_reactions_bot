@@ -102,11 +102,7 @@ async fn main() {
     Dispatcher::builder(bot, handler).dependencies(dptree::deps![pool]).enable_ctrlc_handler().build().dispatch().await;
 }
 
-// --- Background Video Editing Task ---
-
-// --- Background Video Editing Task ---
-
-use std::path::PathBuf; // Add this to your imports at the top
+use std::path::PathBuf; // Make sure this is in your imports at the top of the file
 
 // --- Background Video Editing Task ---
 
@@ -147,7 +143,6 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         return;
     }
 
-
     let frame_extraction_status = tokio::process::Command::new("ffmpeg")
         .arg("-i").arg(&input_path).arg("-vframes").arg("1").arg(&frame_path).status().await.ok();
     if frame_extraction_status.is_none() || !frame_extraction_status.unwrap().success() {
@@ -157,18 +152,16 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
 
     let detected_boxes = detect_white_or_black_boxes(&frame_path);
     let messages: Vec<&str> = text_parts.split("///").collect();
-    // --- UPDATED: Use the new universal font path ---
     let font_path_str = std::env::var("UNIVERSAL_FONT_PATH").expect("UNIVERSAL_FONT_PATH must be set in .env");
     let font_path = PathBuf::from(&font_path_str);
     let font_name = font_path.file_stem().and_then(|s| s.to_str()).unwrap_or("Noto Sans");
 
-
-    let final_filter_chain: String;
-    let final_map_tag = "[v_out]";
+    let ass_content: String;
+    let mut preliminary_filters: Vec<String> = vec![];
+    let final_map_tag: String; // Will hold the name of the final video stream from the preliminary filters
 
     if detected_boxes.is_empty() {
-        // --- NEW LOGIC: NO BOXES FOUND -> Use Subtitles Filter for Wrapping ---
-        let full_text = messages.join("\\N").trim().to_string(); // Join with \N for hard breaks in ASS format
+        let full_text = messages.join("\\N").trim().to_string();
         if full_text.is_empty() {
              bot.edit_message_text_inline(&inline_message_id, "❌ Error: No text provided to add to video.").await.ok();
              return;
@@ -178,11 +171,11 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         let font_size = (pad_height as f32 * 0.4).max(30.0) as u32;
         let v_margin = (pad_height as f32 * 0.25) as u32;
 
-        let ass_content = format!(
+        final_map_tag = "[padded_v]".to_string();
+        preliminary_filters.push(format!("[0:v]pad=width=in_w:height=in_h+{pad}:x=0:y={pad}:color=black{out}", pad = pad_height, out = &final_map_tag));
+
+        ass_content = format!(
             r#"[Script Info]
-Title: Default Aegisub file
-ScriptType: v4.00+
-WrapStyle: 0
 PlayResX: {width}
 PlayResY: {height}
 
@@ -198,67 +191,80 @@ Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
             font_name = font_name,
             font_size = font_size,
             v_margin = v_margin,
-            text = full_text
-        );
-
-        let ass_path = temp_dir_path.join("subs.ass");
-        if tokio::fs::write(&ass_path, ass_content).await.is_err() {
-            bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not write temporary subtitle file.").await.ok();
-            return;
-        }
-
-        // FFmpeg requires path separators to be escaped.
-        let escaped_ass_path = ass_path.to_string_lossy().replace('\\', "/");
-
-        final_filter_chain = format!(
-            "[0:v]pad=width=in_w:height=in_h+{pad}:x=0:y={pad}:color=black, subtitles=filename='{subs_path}', format=yuv420p[v_out]",
-            pad = pad_height,
-            subs_path = escaped_ass_path
+            text = full_text.replace('{', "\\{").replace('}', "\\}")
         );
     } else {
-        // --- EXISTING LOGIC: BOXES FOUND -> Overwrite them (now using the universal font) ---
-        let mut filter_parts = vec![];
         let mut last_tag = "[0:v]".to_string();
-        let boxes_to_edit = detected_boxes.iter().take(messages.len());
+        let mut event_lines = String::new();
 
-        for (i, bbox) in boxes_to_edit.enumerate() {
-            let text_to_draw = messages.get(i).unwrap_or(&messages[0]).trim();
-            let sanitized_text = text_to_draw.replace('\'', r"\'");
+        for (i, bbox) in detected_boxes.iter().take(messages.len()).enumerate() {
             let current_tag = format!("[v{}]", i);
-            let font_size = (bbox.h as f32 * 0.6).max(24.0) as u32;
-
             let filter = format!(
-                "{last_tag}drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill, \
-                 drawtext=fontfile='{font}':text='{txt}':fontcolor=black:fontsize={fs}:x={x}+(({w}-text_w)/2):y={y}+(({h}-text_h)/2){out}",
-                last_tag = &last_tag,
-                x=bbox.x, y=bbox.y, w=bbox.w, h=bbox.h,
-                font=font_path_str, // Use the string path here
-                txt=sanitized_text,
-                fs=font_size,
-                out=&current_tag
+                "{last_tag}drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill{out}",
+                last_tag = &last_tag, x = bbox.x, y = bbox.y, w = bbox.w, h = bbox.h, out = &current_tag
             );
-            filter_parts.push(filter);
+            preliminary_filters.push(filter);
             last_tag = current_tag;
+
+            let text_to_draw = messages.get(i).unwrap_or(&messages[0]).trim();
+            let font_size = (bbox.h as f32 * 0.1).max(5.0) as u32;
+            let center_x = bbox.x + (bbox.w as i32 / 2);
+            let center_y = bbox.y + (bbox.h as i32 / 2);
+            let ass_safe_text = text_to_draw.replace('{', "\\{").replace('}', "\\}");
+
+            let event = format!(
+                r#"Dialogue: 0,0:00:00.00,9:59:59.99,BoxStyle,,0,0,0,,{{\fs{fs}\pos({cx}, {cy})}}{text}"#,
+                fs = font_size, cx = center_x, cy = center_y, text = ass_safe_text
+            );
+            event_lines.push_str(&event);
+            event_lines.push('\n');
         }
 
-        let final_format_filter = format!("{last_tag}format=yuv420p[v_out]", last_tag = &last_tag);
-        filter_parts.push(final_format_filter);
-        final_filter_chain = filter_parts.join(";");
+        final_map_tag = last_tag; // Move ownership of the final tag string
+
+        ass_content = format!(
+            r#"[Script Info]
+PlayResX: {width}
+PlayResY: {height}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: BoxStyle,{font_name},100,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+{event_lines}"#,
+            width = width, height = height, font_name = font_name, event_lines = event_lines
+        );
     }
+
+    let ass_path = temp_dir_path.join("subs.ass");
+    if tokio::fs::write(&ass_path, ass_content).await.is_err() {
+        bot.edit_message_text_inline(&inline_message_id, "❌ Error: Could not write temporary subtitle file.").await.ok();
+        return;
+    }
+
+    let escaped_ass_path = ass_path.to_string_lossy().replace('\\', "/");
+
+    // --- SIMPLIFIED: Chain the preliminary filters with the subtitles filter ---
+    let prelim_filter_chain = preliminary_filters.join(";");
+    let final_filter_chain = format!(
+        "{prelim_chain}; {final_video_stream}subtitles=filename='{subs_path}', format=yuv420p[v_out]",
+        prelim_chain = prelim_filter_chain,
+        final_video_stream = &final_map_tag,
+        subs_path = escaped_ass_path,
+    );
 
     let mut command = tokio::process::Command::new("ffmpeg");
     command.arg("-i").arg(&input_path).arg("-filter_complex").arg(&final_filter_chain)
-        .arg("-map").arg(final_map_tag).arg("-map").arg("0:a?").arg("-c:a").arg("copy");
+        .arg("-map").arg("[v_out]").arg("-map").arg("0:a?").arg("-c:a").arg("copy");
 
     let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
     if !encoder.is_empty() {
-        log::info!("Using hardware encoder: {}", &encoder);
         command.arg("-c:v").arg(&encoder);
     } else if env::var("CUDA_ENABLED").is_ok() {
-        log::info!("Using NVIDIA CUDA encoder: h264_nvenc");
-        command.arg("-c:v").arg("h264_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0");
+        command.arg("-c:v").arg("h24_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0");
     } else {
-        log::info!("Using CPU encoder with 'ultrafast' preset.");
         command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast");
     }
     command.arg("-flags").arg("+global_header").arg("-movflags").arg("+faststart").arg("-pix_fmt").arg("yuv420p").arg(&output_path);
