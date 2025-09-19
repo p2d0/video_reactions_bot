@@ -118,7 +118,7 @@ async fn main() {
     Dispatcher::builder(bot, handler).dependencies(dptree::deps![pool]).enable_ctrlc_handler().build().dispatch().await;
 }
 
-/// **NEW**: Helper function to format seconds into H:MM:SS.cs for ASS subtitles.
+/// Helper function to format seconds into H:MM:SS.cs for ASS subtitles.
 fn format_ass_time(seconds: f64) -> String {
     let hours = (seconds / 3600.0).floor();
     let minutes = ((seconds % 3600.0) / 60.0).floor();
@@ -179,52 +179,86 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
     let font_path = PathBuf::from(&font_path_str);
     let font_name = font_path.file_stem().and_then(|s| s.to_str()).unwrap_or("Noto Sans");
 
-    let ass_content: String;
+    let mut ass_content: String;
     let mut preliminary_filters: Vec<String> = vec![];
-    let final_map_tag: String;
+    let mut final_map_tag = "[0:v]".to_string();
 
-    // **MODIFIED**: Check for timed edit format (text1///time///text2) first.
     let is_timed_edit = messages.len() == 3 && messages[1].parse::<f64>().is_ok();
 
     if is_timed_edit {
-        let text1 = messages[0].trim().replace('{', "\\{").replace('}', "\\}");
+        let text1 = messages[0].trim();
         let time_s = messages[1].parse::<f64>().unwrap_or(0.0);
-        let text2 = messages[2].trim().replace('{', "\\{").replace('}', "\\}");
+        let text2 = messages[2].trim();
 
-        let end_time1 = format_ass_time(time_s);
-        let start_time2 = format_ass_time(time_s);
+        let end_time1_str = format_ass_time(time_s);
+        let start_time2_str = format_ass_time(time_s);
+        let ass_safe_text1 = text1.replace('{', "\\{").replace('}', "\\}");
+        let ass_safe_text2 = text2.replace('{', "\\{").replace('}', "\\}");
 
-        let pad_height = (height as f32 * 0.15).max(100.0) as u32;
-        let font_size = (pad_height as f32 * 0.4).max(30.0) as u32;
-        let v_margin = (pad_height as f32 * 0.25) as u32;
+        if let Some(bbox) = detected_boxes.get(0) {
+            // Case 1: Timed edit inside a detected box.
+            // **FIX**: Add the drawbox filter to fill the box with white first.
+            let current_tag = "[v_box]".to_string();
+            let filter = format!(
+                "{last_tag}drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill{out}",
+                last_tag = &final_map_tag, // Starts as "[0:v]"
+                x = bbox.x, y = bbox.y, w = bbox.w, h = bbox.h, out = &current_tag
+            );
+            preliminary_filters.push(filter);
+            final_map_tag = current_tag; // The next filter will use the output of drawbox.
 
-        final_map_tag = "[padded_v]".to_string();
-        preliminary_filters.push(format!("[0:v]pad=width=in_w:height=in_h+{pad}:x=0:y={pad}:color=black{out}", pad = pad_height, out = &final_map_tag));
+            let font_size = (bbox.h as f32 * 0.1).max(5.0) as u32;
+            let center_x = bbox.x + (bbox.w as i32 / 2);
+            let center_y = bbox.y + (bbox.h as i32 / 2);
 
-        ass_content = format!(
-            r#"[Script Info]
+            let event1 = format!(
+                r#"Dialogue: 0,0:00:00.00,{end_time},BoxStyle,,0,0,0,,{{\fs{fs}\pos({cx}, {cy})}}{text}"#,
+                end_time = end_time1_str, fs = font_size, cx = center_x, cy = center_y, text = ass_safe_text1
+            );
+            let event2 = format!(
+                r#"Dialogue: 0,{start_time},9:59:59.99,BoxStyle,,0,0,0,,{{\fs{fs}\pos({cx}, {cy})}}{text}"#,
+                start_time = start_time2_str, fs = font_size, cx = center_x, cy = center_y, text = ass_safe_text2
+            );
+
+            ass_content = format!(
+                r#"[Script Info]
 PlayResX: {width}
 PlayResY: {height}
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: BoxStyle,{font_name},100,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+{event1}
+{event2}"#,
+                width = width, height = height, font_name = font_name, event1 = event1, event2 = event2
+            );
+        } else {
+            // Case 2: Timed edit, but no box detected. Fallback to padding.
+            let pad_height = (height as f32 * 0.15).max(100.0) as u32;
+            let font_size = (pad_height as f32 * 0.4).max(30.0) as u32;
+            let v_margin = (pad_height as f32 * 0.25) as u32;
+            let padded_tag = "[padded_v]".to_string();
+            preliminary_filters.push(format!("[0:v]pad=width=in_w:height=in_h+{pad}:x=0:y={pad}:color=black{out}", pad = pad_height, out = &padded_tag));
+            final_map_tag = padded_tag;
 
+            ass_content = format!(
+                r#"[Script Info]
+PlayResX: {width}
+PlayResY: {height}
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Caption,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,8,10,10,{v_margin},1
-
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.00,{end_time1},Caption,,0,0,0,,{text1}
 Dialogue: 0,{start_time2},9:59:59.99,Caption,,0,0,0,,{text2}"#,
-            width = width,
-            height = height + pad_height,
-            font_name = font_name,
-            font_size = font_size,
-            v_margin = v_margin,
-            end_time1 = end_time1,
-            start_time2 = start_time2,
-            text1 = text1,
-            text2 = text2
-        );
+                width = width, height = height + pad_height, font_name = font_name, font_size = font_size, v_margin = v_margin,
+                end_time1 = end_time1_str, start_time2 = start_time2_str, text1 = ass_safe_text1, text2 = ass_safe_text2
+            );
+        }
     } else if detected_boxes.is_empty() {
+        // Case 3: Non-timed edit, no boxes found. Pad the video.
         let full_text = messages.join("\\N").trim().to_string();
         if full_text.is_empty() {
              bot.edit_message_text_inline(&inline_message_id, "❌ Error: No text provided to add to video.").await.ok();
@@ -233,8 +267,9 @@ Dialogue: 0,{start_time2},9:59:59.99,Caption,,0,0,0,,{text2}"#,
         let pad_height = (height as f32 * 0.15).max(100.0) as u32;
         let font_size = (pad_height as f32 * 0.4).max(30.0) as u32;
         let v_margin = (pad_height as f32 * 0.25) as u32;
-        final_map_tag = "[padded_v]".to_string();
-        preliminary_filters.push(format!("[0:v]pad=width=in_w:height=in_h+{pad}:x=0:y={pad}:color=black{out}", pad = pad_height, out = &final_map_tag));
+        let padded_tag = "[padded_v]".to_string();
+        preliminary_filters.push(format!("[0:v]pad=width=in_w:height=in_h+{pad}:x=0:y={pad}:color=black{out}", pad = pad_height, out = &padded_tag));
+        final_map_tag = padded_tag;
 
         ass_content = format!(
             r#"[Script Info]
@@ -246,18 +281,14 @@ Style: Caption,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H000000
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
-            width = width,
-            height = height + pad_height,
-            font_name = font_name,
-            font_size = font_size,
-            v_margin = v_margin,
-            text = full_text.replace('{', "\\{").replace('}', "\\}")
+            width = width, height = height + pad_height, font_name = font_name, font_size = font_size,
+            v_margin = v_margin, text = full_text.replace('{', "\\{").replace('}', "\\}")
         );
     } else {
-        let mut last_tag = "[0:v]".to_string();
+        // Case 4: Non-timed edit, boxes found. Fill boxes with text.
+        let mut last_tag = final_map_tag; // Starts as "[0:v]"
         let mut event_lines = String::new();
         for (i, bbox) in detected_boxes.iter().take(messages.len()).enumerate() {
-            log::info!("Detected box {}: {:?}", i + 1, bbox);
             let current_tag = format!("[v{}]", i);
             let filter = format!(
                 "{last_tag}drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill{out}",
@@ -300,14 +331,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     let escaped_ass_path = ass_path.to_string_lossy().replace('\\', "/");
 
-    let prelim_filter_chain = if preliminary_filters.is_empty() { "".to_string() } else { format!("{};", preliminary_filters.join(";")) };
-
-    let final_filter_chain = format!(
-        "{prelim_chain}{final_video_stream}subtitles=filename='{subs_path}', format=yuv420p[v_out]",
-        prelim_chain = prelim_filter_chain,
-        final_video_stream = if preliminary_filters.is_empty() { "[0:v]" } else { &final_map_tag },
-        subs_path = escaped_ass_path,
-    );
+    let final_filter_chain = if preliminary_filters.is_empty() {
+         // This case should now only be hit if there are no boxes AND it's not a timed edit (which pads).
+         // Adding it for robustness, but the logic flows should mean it's rarely, if ever, used.
+        format!("[0:v]subtitles=filename='{subs_path}', format=yuv420p[v_out]", subs_path = escaped_ass_path)
+    } else {
+        let prelim_chain = preliminary_filters.join(";");
+        format!("{prelim_chain}; {final_video_stream}subtitles=filename='{subs_path}', format=yuv420p[v_out]",
+            prelim_chain = prelim_chain,
+            final_video_stream = &final_map_tag,
+            subs_path = escaped_ass_path)
+    };
 
     let mut command = tokio::process::Command::new("ffmpeg");
     command.arg("-i").arg(&input_path).arg("-filter_complex").arg(&final_filter_chain)
@@ -335,6 +369,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             log::warn!("Failed to edit inline message.");
         }
     } else {
+        let stderr = command.output().await.map(|o| String::from_utf8_lossy(&o.stderr).to_string()).unwrap_or_else(|e| e.to_string());
+        log::error!("FFMPEG failed. Filter: '{}'. Stderr: {}", final_filter_chain, stderr);
         bot.edit_message_text_inline(&inline_message_id, "❌ An error occurred during video processing.").await.ok();
     }
 }
@@ -370,7 +406,7 @@ async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool:
                 let edit_params = edit_params_raw.trim();
                 let mut final_edit_text = String::new();
 
-                // **MODIFIED**: Parse for timed edit format first: `text1 /time text2`
+                // Parse for timed edit format first: `text1 /time text2`
                 if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
                     if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
                         if time_str.parse::<f64>().is_ok() {
@@ -409,7 +445,7 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
         let edit_params = edit_params_raw.trim();
         let mut display_description = String::new();
 
-        // **MODIFIED**: Create a user-friendly description for the timed edit format.
+        // Create a user-friendly description for the timed edit format.
         if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
             if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
                 if let Ok(time) = time_str.parse::<f64>() {
