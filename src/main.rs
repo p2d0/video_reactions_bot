@@ -30,52 +30,77 @@ enum Command {
 #[derive(Debug, Clone, Copy)]
 struct BoundingBox { x: i32, y: i32, w: u32, h: u32 }
 
-// MODIFIED: This function now detects white boxes, and if none are found, falls back to detecting black boxes.
-fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
-    let Some(img) = ImageReader::open(image_path).ok().and_then(|r| r.decode().ok()) else { return vec![]; };
-
-    // First, convert the whole image to grayscale
-    let gray_image = img.to_luma8();
-
-    // --- 1. Attempt to find WHITE boxes ---
-    let white_binary_image = imageproc::map::map_pixels(&gray_image, |_, _, p| {
-        if p[0] > 250 { image::Luma([255]) } else { image::Luma([0]) }
-    });
-
-    let contours: Vec<Contour<i32>> = find_contours(&white_binary_image);
-
-    let mut boxes: Vec<Rect> = contours.iter().filter(|c| !c.points.is_empty()).map(|contour| {
-        let mut min_x = i32::MAX; let mut min_y = i32::MAX; let mut max_x = i32::MIN; let mut max_y = i32::MIN;
-        for point in &contour.points {
-            min_x = min_x.min(point.x); min_y = min_y.min(point.y); max_x = max_x.max(point.x); max_y = max_y.max(point.y);
-        }
-        Rect::at(min_x, min_y).of_size((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32)
-    }).filter(|rect| rect.width() > 50 && rect.height() > 50).collect();
-
-    // --- 2. If no white boxes were found, search for BLACK boxes ---
-    if boxes.is_empty() {
-        // Apply a threshold to find very dark regions, making them white for contour detection.
-        let black_binary_image = imageproc::map::map_pixels(&gray_image, |_, _, p| {
-            if p[0] < 1 { image::Luma([255]) } else { image::Luma([0]) }
-        });
-
-        let black_contours: Vec<Contour<i32>> = find_contours(&black_binary_image);
-
-        boxes = black_contours.iter().filter(|c| !c.points.is_empty()).map(|contour| {
-            let mut min_x = i32::MAX; let mut min_y = i32::MAX; let mut max_x = i32::MIN; let mut max_y = i32::MIN;
+/// Helper function to convert contours into bounding boxes, filtering for a minimum size.
+/// (This function remains unchanged)
+fn contours_to_bounding_boxes(
+    contours: &[Contour<i32>],
+    min_width: u32,
+    min_height: u32,
+) -> Vec<Rect> {
+    contours.iter()
+        .filter(|c| !c.points.is_empty())
+        .map(|contour| {
+            let mut min_x = i32::MAX; let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN; let mut max_y = i32::MIN;
             for point in &contour.points {
-                min_x = min_x.min(point.x); min_y = min_y.min(point.y); max_x = max_x.max(point.x); max_y = max_y.max(point.y);
+                min_x = min_x.min(point.x);
+                min_y = min_y.min(point.y);
+                max_x = max_x.max(point.x);
+                max_y = max_y.max(point.y);
             }
             Rect::at(min_x, min_y).of_size((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32)
-        }).filter(|rect| rect.width() > 50 && rect.height() > 50).collect();
+        })
+        .filter(|rect| rect.width() >= min_width && rect.height() >= min_height)
+        .collect()
+}
+
+/// MODIFIED: Detects large boxes by first padding the image to reliably find shapes touching the edges.
+fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
+    let Some(img) = ImageReader::open(image_path).ok().and_then(|r| r.decode().ok()) else { return vec![]; };
+    let original_luma = img.to_luma8();
+    let (original_width, original_height) = original_luma.dimensions();
+
+    // --- 1. IMPROVEMENT: Pad the image with a black border ---
+    // This ensures that any shapes touching the edges of the original image are
+    // now fully enclosed, allowing find_contours to detect them reliably.
+    const PADDING: u32 = 1;
+    let mut padded_image = image::GrayImage::new(original_width + PADDING * 2, original_height + PADDING * 2);
+    image::imageops::replace(&mut padded_image, &original_luma, PADDING as i64, PADDING as i64);
+
+    // --- 2. Define "big" relative to the ORIGINAL image size ---
+    const MIN_BOX_DIM_RATIO: f32 = 0.1;
+    let min_width = (original_width as f32 * MIN_BOX_DIM_RATIO) as u32;
+    let min_height = (original_height as f32 * MIN_BOX_DIM_RATIO) as u32;
+
+    // --- 3. Attempt to find WHITE boxes on the padded image ---
+    // A slightly more lenient threshold can help with compression artifacts.
+    let white_binary_image = imageproc::map::map_pixels(&padded_image, |_, _, p| {
+        if p[0] > 250 { image::Luma([255]) } else { image::Luma([0]) }
+    });
+    let contours = find_contours(&white_binary_image);
+    let mut boxes = contours_to_bounding_boxes(&contours, min_width, min_height);
+
+    // --- 4. If no white boxes were found, search for BLACK boxes ---
+    if boxes.is_empty() {
+        let black_binary_image = imageproc::map::map_pixels(&padded_image, |_, _, p| {
+            if p[0] < 5 { image::Luma([255]) } else { image::Luma([0]) }
+        });
+        let black_contours = find_contours(&black_binary_image);
+        boxes = contours_to_bounding_boxes(&black_contours, min_width, min_height);
     }
 
-    // --- 3. Sort and take the largest 2 boxes found (either white or black) ---
+    // --- 5. Sort, take the largest, and adjust coordinates back to original ---
     boxes.sort_by_key(|b| Reverse(b.width() * b.height()));
-
-    boxes.into_iter().take(2).map(|rect| BoundingBox {
-        x: rect.left(), y: rect.top(), w: rect.width(), h: rect.height(),
-    }).collect()
+    boxes.into_iter()
+        .take(2)
+        .map(|rect| BoundingBox {
+            // Adjust coordinates to remove the padding offset
+            x: rect.left() - PADDING as i32,
+            y: rect.top() - PADDING as i32,
+            w: rect.width(),
+            h: rect.height(),
+        })
+        .collect()
 }
 
 
@@ -263,7 +288,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     if !encoder.is_empty() {
         command.arg("-c:v").arg(&encoder);
     } else if env::var("CUDA_ENABLED").is_ok() {
-        command.arg("-c:v").arg("h24_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0");
+        command.arg("-c:v").arg("h264_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0");
     } else {
         command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast");
     }
