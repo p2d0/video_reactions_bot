@@ -207,7 +207,7 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
             preliminary_filters.push(filter);
             final_map_tag = current_tag; // The next filter will use the output of drawbox.
 
-            let font_size = (bbox.h as f32 * 0.1).max(5.0) as u32;
+            let font_size = (bbox.h as f32 * 0.1).max(10.0) as u32;
             let center_x = bbox.x + (bbox.w as i32 / 2);
             let center_y = bbox.y + (bbox.h as i32 / 2);
 
@@ -297,7 +297,7 @@ Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
             preliminary_filters.push(filter);
             last_tag = current_tag;
             let text_to_draw = messages.get(i).unwrap_or(&messages[0]).trim();
-            let font_size = (bbox.h as f32 * 0.1).max(5.0) as u32;
+            let font_size = (bbox.h as f32 * 0.1).max(7.0) as u32;
             let center_x = bbox.x + (bbox.w as i32 / 2);
             let center_y = bbox.y + (bbox.h as i32 / 2);
             let ass_safe_text = text_to_draw.replace('{', "\\{").replace('}', "\\}");
