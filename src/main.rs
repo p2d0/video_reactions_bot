@@ -68,7 +68,7 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     image::imageops::replace(&mut padded_image, &original_luma, PADDING as i64, PADDING as i64);
 
     // --- 2. Define "big" relative to the ORIGINAL image size ---
-    const MIN_BOX_DIM_RATIO: f32 = 0.1;
+    const MIN_BOX_DIM_RATIO: f32 = 0.2;
     let min_width = (original_width as f32 * MIN_BOX_DIM_RATIO) as u32;
     let min_height = (original_height as f32 * MIN_BOX_DIM_RATIO) as u32;
 
@@ -223,6 +223,7 @@ Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
         let mut event_lines = String::new();
 
         for (i, bbox) in detected_boxes.iter().take(messages.len()).enumerate() {
+            log::info!("Detected box {}: {:?}", i + 1, bbox);
             let current_tag = format!("[v{}]", i);
             let filter = format!(
                 "{last_tag}drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill{out}",
