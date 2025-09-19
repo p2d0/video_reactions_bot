@@ -21,9 +21,9 @@ type SharedState = SqlitePool;
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "These commands are supported:")]
 enum Command {
-    #[command(description = "Displays this help message.")]
+    #[command(description = "Displays this help message")]
     Help,
-    #[command(description = "Start a dialog to remove a saved video.")]
+    #[command(description = "Start a dialog to remove a saved video")]
     Remove,
 }
 
@@ -379,6 +379,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 // --- Bot Handlers ---
 
+// Replace your existing handle_command function with this one.
 async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState) -> Result<(), teloxide::RequestError> {
     // We need the user's ID for the remove command, so get it early.
     let Some(user) = msg.from() else {
@@ -389,7 +390,24 @@ async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState)
 
     match cmd {
         Command::Help => {
-            bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?;
+            // Combine the auto-generated descriptions with detailed inline usage instructions.
+            let command_descriptions = Command::descriptions().to_string();
+            let help_text = format!(
+                "{}\n\n*Inline Editing Guide*\n\n\
+                To edit a video, type the bot's username in any chat, followed by a search for your saved video, then use `/edit`\n\n\
+                *Examples:*\n\
+                `@bot_username cat video /edit New funny text`\n\n\
+                *Advanced Formats:*\n\n\
+                *1 Two\\-Box Edit:*\n\
+                Provide text for the top two detected boxes using `/box2`\n\
+                `@bot_username /edit Top Text /box2 Bottom Text`\n\n\
+                *2 Timed Text Edit:*\n\
+                Change the text in the first detected box at a specific time\n\
+                `@bot_username /edit Text Before /55 Text After`",
+                command_descriptions
+            );
+
+            bot.send_message(msg.chat.id, help_text).parse_mode(ParseMode::MarkdownV2).await?;
         }
         Command::Remove => {
             // UPDATED QUERY: Select all columns and filter with a WHERE clause
