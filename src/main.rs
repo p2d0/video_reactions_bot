@@ -320,6 +320,7 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
 /// --- NEW: Background task to process and save a video ---
 /// --- NEW: Background task to process and save a video ---
 /// --- MODIFIED: Background task to process, CROP, and save a video ---
+/// --- MODIFIED: Background task to process, CROP, and save a video ---
 async fn process_and_save_video(
     bot: Bot,
     chat_id: ChatId,
@@ -371,15 +372,15 @@ async fn process_and_save_video(
             let bbox = &detected_boxes[0];
             let video_height = video.height;
 
-            // --- START OF CROP LOGIC ---
-            // Heuristic: If the box's center is in the top half of the video, we assume it's a top bar.
-            // Otherwise, we assume it's a bottom bar that needs to be cropped off.
+            // --- START OF FIX: Add a small margin to remove border pixels ---
+            const CROP_MARGIN: u32 = 2; // Shave off 2 extra pixels to be safe.
+
             let is_top_box = (bbox.y as u32 + bbox.h / 2) < (video_height / 2);
 
             let filter_complex = if is_top_box {
                 // The box is at the top. We want to keep the area *below* it.
-                // The new video's top-left corner starts at y = (box's y + box's height).
-                let crop_start_y = bbox.y as u32 + bbox.h;
+                // Start the crop a few pixels below the box to ensure we remove any border line.
+                let crop_start_y = (bbox.y as u32 + bbox.h + CROP_MARGIN).min(video_height);
                 // The new video's height is the original height minus where the crop starts.
                 let new_height = video_height - crop_start_y;
 
@@ -390,22 +391,21 @@ async fn process_and_save_video(
                 )
             } else {
                 // The box is at the bottom. We want to keep the area *above* it.
-                // The new video's height is simply the y-coordinate where the box begins.
-                let new_height = bbox.y as u32;
+                // The new video's height is the y-coordinate where the box begins, minus a small margin.
+                let new_height = (bbox.y as u32).saturating_sub(CROP_MARGIN);
 
                 format!(
                     "[0:v]crop=w=in_w:h={h}:x=0:y=0[v_out]",
                     h = new_height
                 )
             };
-            // --- END OF CROP LOGIC ---
+            // --- END OF FIX ---
 
             let mut command = tokio::process::Command::new("ffmpeg");
-            // Apply the complex filter and then explicitly map the resulting video and original audio.
             command.arg("-i").arg(&input_path)
                    .arg("-filter_complex").arg(&filter_complex)
-                   .arg("-map").arg("[v_out]") // Map the processed video stream
-                   .arg("-map").arg("0:a?")    // Map the original audio stream (if it exists)
+                   .arg("-map").arg("[v_out]")
+                   .arg("-map").arg("0:a?")
                    .arg("-c:a").arg("copy");
 
             let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
