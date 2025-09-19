@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use tempfile::Builder;
 use tokio::fs;
 use teloxide::net::Download;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::cmp::Reverse;
 use std::env;
 
@@ -31,7 +31,6 @@ enum Command {
 struct BoundingBox { x: i32, y: i32, w: u32, h: u32 }
 
 /// Helper function to convert contours into bounding boxes, filtering for a minimum size.
-/// (This function remains unchanged)
 fn contours_to_bounding_boxes(
     contours: &[Contour<i32>],
     min_width: u32,
@@ -54,33 +53,26 @@ fn contours_to_bounding_boxes(
         .collect()
 }
 
-/// MODIFIED: Detects large boxes by first padding the image to reliably find shapes touching the edges.
+/// Detects large boxes by first padding the image to reliably find shapes touching the edges.
 fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     let Some(img) = ImageReader::open(image_path).ok().and_then(|r| r.decode().ok()) else { return vec![]; };
     let original_luma = img.to_luma8();
     let (original_width, original_height) = original_luma.dimensions();
 
-    // --- 1. IMPROVEMENT: Pad the image with a black border ---
-    // This ensures that any shapes touching the edges of the original image are
-    // now fully enclosed, allowing find_contours to detect them reliably.
     const PADDING: u32 = 1;
     let mut padded_image = image::GrayImage::new(original_width + PADDING * 2, original_height + PADDING * 2);
     image::imageops::replace(&mut padded_image, &original_luma, PADDING as i64, PADDING as i64);
 
-    // --- 2. Define "big" relative to the ORIGINAL image size ---
-    const MIN_BOX_DIM_RATIO: f32 = 0.2;
+    const MIN_BOX_DIM_RATIO: f32 = 0.1;
     let min_width = (original_width as f32 * MIN_BOX_DIM_RATIO) as u32;
     let min_height = (original_height as f32 * MIN_BOX_DIM_RATIO) as u32;
 
-    // --- 3. Attempt to find WHITE boxes on the padded image ---
-    // A slightly more lenient threshold can help with compression artifacts.
     let white_binary_image = imageproc::map::map_pixels(&padded_image, |_, _, p| {
         if p[0] > 250 { image::Luma([255]) } else { image::Luma([0]) }
     });
     let contours = find_contours(&white_binary_image);
     let mut boxes = contours_to_bounding_boxes(&contours, min_width, min_height);
 
-    // --- 4. If no white boxes were found, search for BLACK boxes ---
     if boxes.is_empty() {
         let black_binary_image = imageproc::map::map_pixels(&padded_image, |_, _, p| {
             if p[0] < 5 { image::Luma([255]) } else { image::Luma([0]) }
@@ -89,13 +81,11 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
         boxes = contours_to_bounding_boxes(&black_contours, min_width, min_height);
     }
 
-    // --- 5. Sort, take the largest, and adjust coordinates back to original ---
     boxes.sort_by_key(|b| Reverse(b.width() * b.height()));
     boxes.into_iter()
-         .filter(|rect| rect.width() < original_width && rect.height() < original_height)
+         .filter(|rect| rect.height() < original_height)
         .take(2)
         .map(|rect| BoundingBox {
-            // Adjust coordinates to remove the padding offset
             x: rect.left() - PADDING as i32,
             y: rect.top() - PADDING as i32,
             w: rect.width(),
@@ -128,7 +118,14 @@ async fn main() {
     Dispatcher::builder(bot, handler).dependencies(dptree::deps![pool]).enable_ctrlc_handler().build().dispatch().await;
 }
 
-use std::path::PathBuf; // Make sure this is in your imports at the top of the file
+/// **NEW**: Helper function to format seconds into H:MM:SS.cs for ASS subtitles.
+fn format_ass_time(seconds: f64) -> String {
+    let hours = (seconds / 3600.0).floor();
+    let minutes = ((seconds % 3600.0) / 60.0).floor();
+    let secs = (seconds % 60.0).floor();
+    let centiseconds = ((seconds.fract() * 100.0).round() as i32).min(99);
+    format!("{}:{:02}:{:02}.{:02}", hours, minutes, secs, centiseconds)
+}
 
 // --- Background Video Editing Task ---
 
@@ -184,14 +181,18 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
 
     let ass_content: String;
     let mut preliminary_filters: Vec<String> = vec![];
-    let final_map_tag: String; // Will hold the name of the final video stream from the preliminary filters
+    let final_map_tag: String;
 
-    if detected_boxes.is_empty() {
-        let full_text = messages.join("\\N").trim().to_string();
-        if full_text.is_empty() {
-             bot.edit_message_text_inline(&inline_message_id, "❌ Error: No text provided to add to video.").await.ok();
-             return;
-        }
+    // **MODIFIED**: Check for timed edit format (text1///time///text2) first.
+    let is_timed_edit = messages.len() == 3 && messages[1].parse::<f64>().is_ok();
+
+    if is_timed_edit {
+        let text1 = messages[0].trim().replace('{', "\\{").replace('}', "\\}");
+        let time_s = messages[1].parse::<f64>().unwrap_or(0.0);
+        let text2 = messages[2].trim().replace('{', "\\{").replace('}', "\\}");
+
+        let end_time1 = format_ass_time(time_s);
+        let start_time2 = format_ass_time(time_s);
 
         let pad_height = (height as f32 * 0.15).max(100.0) as u32;
         let font_size = (pad_height as f32 * 0.4).max(30.0) as u32;
@@ -211,6 +212,39 @@ Style: Caption,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H000000
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,{end_time1},Caption,,0,0,0,,{text1}
+Dialogue: 0,{start_time2},9:59:59.99,Caption,,0,0,0,,{text2}"#,
+            width = width,
+            height = height + pad_height,
+            font_name = font_name,
+            font_size = font_size,
+            v_margin = v_margin,
+            end_time1 = end_time1,
+            start_time2 = start_time2,
+            text1 = text1,
+            text2 = text2
+        );
+    } else if detected_boxes.is_empty() {
+        let full_text = messages.join("\\N").trim().to_string();
+        if full_text.is_empty() {
+             bot.edit_message_text_inline(&inline_message_id, "❌ Error: No text provided to add to video.").await.ok();
+             return;
+        }
+        let pad_height = (height as f32 * 0.15).max(100.0) as u32;
+        let font_size = (pad_height as f32 * 0.4).max(30.0) as u32;
+        let v_margin = (pad_height as f32 * 0.25) as u32;
+        final_map_tag = "[padded_v]".to_string();
+        preliminary_filters.push(format!("[0:v]pad=width=in_w:height=in_h+{pad}:x=0:y={pad}:color=black{out}", pad = pad_height, out = &final_map_tag));
+
+        ass_content = format!(
+            r#"[Script Info]
+PlayResX: {width}
+PlayResY: {height}
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Caption,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,8,10,10,{v_margin},1
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
             width = width,
             height = height + pad_height,
@@ -222,7 +256,6 @@ Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
     } else {
         let mut last_tag = "[0:v]".to_string();
         let mut event_lines = String::new();
-
         for (i, bbox) in detected_boxes.iter().take(messages.len()).enumerate() {
             log::info!("Detected box {}: {:?}", i + 1, bbox);
             let current_tag = format!("[v{}]", i);
@@ -232,13 +265,11 @@ Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
             );
             preliminary_filters.push(filter);
             last_tag = current_tag;
-
             let text_to_draw = messages.get(i).unwrap_or(&messages[0]).trim();
             let font_size = (bbox.h as f32 * 0.1).max(5.0) as u32;
             let center_x = bbox.x + (bbox.w as i32 / 2);
             let center_y = bbox.y + (bbox.h as i32 / 2);
             let ass_safe_text = text_to_draw.replace('{', "\\{").replace('}', "\\}");
-
             let event = format!(
                 r#"Dialogue: 0,0:00:00.00,9:59:59.99,BoxStyle,,0,0,0,,{{\fs{fs}\pos({cx}, {cy})}}{text}"#,
                 fs = font_size, cx = center_x, cy = center_y, text = ass_safe_text
@@ -246,18 +277,14 @@ Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
             event_lines.push_str(&event);
             event_lines.push('\n');
         }
-
-        final_map_tag = last_tag; // Move ownership of the final tag string
-
+        final_map_tag = last_tag;
         ass_content = format!(
             r#"[Script Info]
 PlayResX: {width}
 PlayResY: {height}
-
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: BoxStyle,{font_name},100,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1
-
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 {event_lines}"#,
@@ -273,12 +300,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     let escaped_ass_path = ass_path.to_string_lossy().replace('\\', "/");
 
-    // --- SIMPLIFIED: Chain the preliminary filters with the subtitles filter ---
-    let prelim_filter_chain = preliminary_filters.join(";");
+    let prelim_filter_chain = if preliminary_filters.is_empty() { "".to_string() } else { format!("{};", preliminary_filters.join(";")) };
+
     let final_filter_chain = format!(
-        "{prelim_chain}; {final_video_stream}subtitles=filename='{subs_path}', format=yuv420p[v_out]",
+        "{prelim_chain}{final_video_stream}subtitles=filename='{subs_path}', format=yuv420p[v_out]",
         prelim_chain = prelim_filter_chain,
-        final_video_stream = &final_map_tag,
+        final_video_stream = if preliminary_filters.is_empty() { "[0:v]" } else { &final_map_tag },
         subs_path = escaped_ass_path,
     );
 
@@ -341,11 +368,25 @@ async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool:
 
             if let Some((_, edit_params_raw)) = chosen.query.split_once("/edit") {
                 let edit_params = edit_params_raw.trim();
-                let final_edit_text = if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
-                    format!("{}///{}", msg1.trim(), msg2.trim())
-                } else {
-                    edit_params.to_string()
-                };
+                let mut final_edit_text = String::new();
+
+                // **MODIFIED**: Parse for timed edit format first: `text1 /time text2`
+                if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
+                    if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
+                        if time_str.parse::<f64>().is_ok() {
+                            final_edit_text = format!("{}///{}///{}", msg1.trim(), time_str.trim(), msg2.trim());
+                        }
+                    }
+                }
+
+                // Fallback to other formats if timed edit was not parsed
+                if final_edit_text.is_empty() {
+                    if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
+                        final_edit_text = format!("{}///{}", msg1.trim(), msg2.trim());
+                    } else {
+                        final_edit_text = edit_params.to_string();
+                    }
+                }
 
                 let user_id = chosen.from.id;
                 tokio::spawn(perform_video_edit(
@@ -366,11 +407,25 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
 
     if let Some((search_term, edit_params_raw)) = q.query.split_once("/edit") {
         let edit_params = edit_params_raw.trim();
-        let display_description = if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
-            format!("BOX 1: '{}' | BOX 2: '{}'", msg1.trim(), msg2.trim())
-        } else {
-            format!("Click to replace text with: '{}'", edit_params)
-        };
+        let mut display_description = String::new();
+
+        // **MODIFIED**: Create a user-friendly description for the timed edit format.
+        if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
+            if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
+                if let Ok(time) = time_str.parse::<f64>() {
+                    display_description = format!("TEXT 1: '{}' | TEXT 2: '{}' (at {}s)", msg1.trim(), msg2.trim(), time);
+                }
+            }
+        }
+
+        // Fallback to existing description logic
+        if display_description.is_empty() {
+            if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
+                display_description = format!("BOX 1: '{}' | BOX 2: '{}'", msg1.trim(), msg2.trim());
+            } else {
+                display_description = format!("Click to replace text with: '{}'", edit_params);
+            }
+        }
 
         let search_pattern = format!("%{}%", search_term.trim());
         if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ? LIMIT 1")
@@ -421,10 +476,6 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
     Ok(())
 }
 
-/// --- NEW: Background task to process and save a video ---
-/// --- NEW: Background task to process and save a video ---
-/// --- MODIFIED: Background task to process, CROP, and save a video ---
-/// --- MODIFIED: Background task to process, CROP, and save a video ---
 async fn process_and_save_video(
     bot: Bot,
     chat_id: ChatId,
@@ -476,16 +527,12 @@ async fn process_and_save_video(
             let bbox = &detected_boxes[0];
             let video_height = video.height;
 
-            // --- START OF FIX: Add a small margin to remove border pixels ---
-            const CROP_MARGIN: u32 = 2; // Shave off 2 extra pixels to be safe.
+            const CROP_MARGIN: u32 = 2;
 
             let is_top_box = (bbox.y as u32 + bbox.h / 2) < (video_height / 2);
 
             let filter_complex = if is_top_box {
-                // The box is at the top. We want to keep the area *below* it.
-                // Start the crop a few pixels below the box to ensure we remove any border line.
                 let crop_start_y = (bbox.y as u32 + bbox.h + CROP_MARGIN).min(video_height);
-                // The new video's height is the original height minus where the crop starts.
                 let new_height = video_height - crop_start_y;
 
                 format!(
@@ -494,16 +541,12 @@ async fn process_and_save_video(
                     y = crop_start_y
                 )
             } else {
-                // The box is at the bottom. We want to keep the area *above* it.
-                // The new video's height is the y-coordinate where the box begins, minus a small margin.
                 let new_height = (bbox.y as u32).saturating_sub(CROP_MARGIN);
-
                 format!(
                     "[0:v]crop=w=in_w:h={h}:x=0:y=0[v_out]",
                     h = new_height
                 )
             };
-            // --- END OF FIX ---
 
             let mut command = tokio::process::Command::new("ffmpeg");
             command.arg("-i").arg(&input_path)
@@ -559,7 +602,6 @@ async fn process_and_save_video(
     }
 }
 
-/// --- MODIFIED: Spawns a background task for video processing ---
 async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(), teloxide::RequestError> {
     let mut video_to_save: Option<&Video> = None;
     let mut caption_to_save: Option<&str> = None;
