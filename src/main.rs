@@ -209,7 +209,7 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
 }
 
 
-// --- Bot Handlers (Unchanged) ---
+// --- Bot Handlers ---
 
 async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState) -> Result<(), teloxide::RequestError> {
     match cmd {
@@ -254,22 +254,13 @@ async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool:
 }
 
 async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Result<(), teloxide::RequestError> {
-    // --- START OF CHANGES ---
-
-    // 1. Define a page size (Telegram's limit is 50, so we use a safe value like 30).
     const PAGE_SIZE: i64 = 30;
-
-    // 2. Parse the offset from the inline query. It's a string, so we parse it to a number.
-    // If it's empty or invalid, we default to page 0.
     let page: i64 = q.offset.parse().unwrap_or(0);
     let sql_offset = page * PAGE_SIZE;
 
     let mut results = vec![];
 
-    // Check if we are in "edit" mode or normal search mode.
     if let Some((search_term, edit_params_raw)) = q.query.split_once("/edit") {
-        // This part is for editing, which typically should only find one result.
-        // Paging is less critical here, but we'll keep the logic consistent.
         let edit_params = edit_params_raw.trim();
         let display_description = if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
             format!("BOX 1: '{}' | BOX 2: '{}'", msg1.trim(), msg2.trim())
@@ -278,7 +269,6 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
         };
 
         let search_pattern = format!("%{}%", search_term.trim());
-        // Fetch only one video for editing.
         if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ? LIMIT 1")
             .bind(search_pattern).fetch_optional(&pool).await.unwrap_or(None) {
 
@@ -296,8 +286,6 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
                 results.push(result);
             }
     } else {
-        // This is the normal search mode where paging is essential.
-        // 3. Modify the SQL query to use LIMIT and OFFSET for paging.
         let videos: Vec<VideoData> = if q.query.is_empty() {
             sqlx::query_as("SELECT file_id, caption FROM videos LIMIT ? OFFSET ?")
                 .bind(PAGE_SIZE).bind(sql_offset).fetch_all(&pool).await.unwrap_or_default()
@@ -307,46 +295,196 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
                 .bind(pattern).bind(PAGE_SIZE).bind(sql_offset).fetch_all(&pool).await.unwrap_or_default()
         };
 
-        results = videos.into_iter().enumerate().map(|(i, video)| {
-            // Use a unique ID based on the video file_id instead of enumeration index
+        results = videos.into_iter().enumerate().map(|(_, video)| {
             let mut result_id = video.file_id.clone();
-            result_id.truncate(60); // InlineQueryResult result_id has a 64-byte limit.
+            result_id.truncate(60);
             InlineQueryResult::CachedVideo(InlineQueryResultCachedVideo::new(result_id, video.file_id, video.caption.clone()))
         }).collect();
     }
 
-    // 4. Determine the next_offset for the client.
     let next_offset = if results.len() == PAGE_SIZE as usize {
-        // If we received a full page of results, there might be more.
-        // Set the next_offset to the next page number.
         Some((page + 1).to_string())
     } else {
-        // If we received less than a full page, this is the end.
-        // An empty offset tells the client not to request more.
         None
     };
 
-    // 5. Send the results back with the next_offset.
     let mut answer = bot.answer_inline_query(q.id, results);
     if let Some(offset) = next_offset {
         answer = answer.next_offset(offset);
     }
     answer.await?;
 
-    // --- END OF CHANGES ---
-
     Ok(())
 }
 
+/// --- NEW: Background task to process and save a video ---
+/// --- NEW: Background task to process and save a video ---
+/// --- MODIFIED: Background task to process, CROP, and save a video ---
+async fn process_and_save_video(
+    bot: Bot,
+    chat_id: ChatId,
+    user_message_id: MessageId,
+    status_message_id: MessageId,
+    video: Video,
+    caption: String,
+    pool: SharedState,
+) {
+    let temp_dir = match Builder::new().prefix("video_save").tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::error!("Failed to create temp dir: {}", e);
+            let _ = bot.edit_message_text(chat_id, status_message_id, "❌ Error: Server failed to create temporary directory.").await;
+            return;
+        }
+    };
+    let temp_dir_path = temp_dir.path();
+    let input_path = temp_dir_path.join("input.mp4");
+    let output_path = temp_dir_path.join("output.mp4");
+    let frame_path = temp_dir_path.join("frame.png");
+
+    let final_file_id: String;
+    let final_message_text: String;
+
+    'processing_block: {
+        let Ok(file) = bot.get_file(&video.file.id).await else {
+            let _ = bot.edit_message_text(chat_id, status_message_id, "❌ Error: Failed to get file info from Telegram.").await;
+            return;
+        };
+        let Ok(mut dest) = fs::File::create(&input_path).await else { return; };
+        if bot.download_file(&file.path, &mut dest).await.is_err() {
+            let _ = bot.edit_message_text(chat_id, status_message_id, "❌ Error: Failed to download video.").await;
+            return;
+        };
+
+        let frame_extraction_status = tokio::process::Command::new("ffmpeg")
+            .arg("-i").arg(&input_path).arg("-vframes").arg("1").arg(&frame_path).status().await.ok();
+        if frame_extraction_status.is_none() || !frame_extraction_status.unwrap().success() {
+            log::warn!("Failed to extract frame for video save check. Saving original.");
+            final_file_id = video.file.id;
+            final_message_text = "⚠️ Could not analyze video, saved original.".to_string();
+            break 'processing_block;
+        }
+
+        let detected_boxes = detect_white_or_black_boxes(&frame_path);
+
+        if detected_boxes.len() == 1 {
+            let bbox = &detected_boxes[0];
+            let video_height = video.height;
+
+            // --- START OF CROP LOGIC ---
+            // Heuristic: If the box's center is in the top half of the video, we assume it's a top bar.
+            // Otherwise, we assume it's a bottom bar that needs to be cropped off.
+            let is_top_box = (bbox.y as u32 + bbox.h / 2) < (video_height / 2);
+
+            let filter_complex = if is_top_box {
+                // The box is at the top. We want to keep the area *below* it.
+                // The new video's top-left corner starts at y = (box's y + box's height).
+                let crop_start_y = bbox.y as u32 + bbox.h;
+                // The new video's height is the original height minus where the crop starts.
+                let new_height = video_height - crop_start_y;
+
+                format!(
+                    "[0:v]crop=w=in_w:h={h}:x=0:y={y}[v_out]",
+                    h = new_height,
+                    y = crop_start_y
+                )
+            } else {
+                // The box is at the bottom. We want to keep the area *above* it.
+                // The new video's height is simply the y-coordinate where the box begins.
+                let new_height = bbox.y as u32;
+
+                format!(
+                    "[0:v]crop=w=in_w:h={h}:x=0:y=0[v_out]",
+                    h = new_height
+                )
+            };
+            // --- END OF CROP LOGIC ---
+
+            let mut command = tokio::process::Command::new("ffmpeg");
+            // Apply the complex filter and then explicitly map the resulting video and original audio.
+            command.arg("-i").arg(&input_path)
+                   .arg("-filter_complex").arg(&filter_complex)
+                   .arg("-map").arg("[v_out]") // Map the processed video stream
+                   .arg("-map").arg("0:a?")    // Map the original audio stream (if it exists)
+                   .arg("-c:a").arg("copy");
+
+            let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
+            if !encoder.is_empty() { command.arg("-c:v").arg(&encoder); }
+            else if env::var("CUDA_ENABLED").is_ok() { command.arg("-c:v").arg("h264_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0"); }
+            else { command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast"); }
+
+            command.arg("-flags").arg("+global_header").arg("-movflags").arg("+faststart").arg("-pix_fmt").arg("yuv420p").arg(&output_path);
+
+            if command.status().await.is_ok_and(|s| s.success()) {
+                let sent_message = match bot.send_video(chat_id, InputFile::file(&output_path)).caption(&caption).reply_to_message_id(user_message_id).await {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        log::error!("Failed to send processed video: {}", e);
+                        let _ = bot.edit_message_text(chat_id, status_message_id, "❌ Error: Could not send the processed video.").await;
+                        return;
+                    }
+                };
+
+                if let Some(new_video) = sent_message.video() {
+                    final_file_id = new_video.file.id.clone();
+                    final_message_text = "✅ Video cropped and saved!".to_string();
+                } else {
+                    let _ = bot.edit_message_text(chat_id, status_message_id, "❌ Error: Telegram did not return video data after upload.").await;
+                    return;
+                }
+            } else {
+                final_file_id = video.file.id;
+                final_message_text = "⚠️ Video processing failed, saved original.".to_string();
+            }
+        } else {
+            final_file_id = video.file.id;
+            final_message_text = if detected_boxes.is_empty() {
+                "✅ Video saved! (No removable box was detected)".to_string()
+            } else {
+                format!("✅ Video saved! ({} boxes detected, expected 1 for cropping)", detected_boxes.len())
+            };
+        }
+    }
+
+    if sqlx::query("INSERT OR IGNORE INTO videos (file_id, caption) VALUES (?, ?)")
+        .bind(&final_file_id).bind(&caption).execute(&pool).await.is_ok()
+    {
+        bot.edit_message_text(chat_id, status_message_id, final_message_text).await.ok();
+    } else {
+        bot.edit_message_text(chat_id, status_message_id, "❌ DB error while saving video.").await.ok();
+    }
+}
+
+/// --- MODIFIED: Spawns a background task for video processing ---
 async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(), teloxide::RequestError> {
-    let mut video_to_save: Option<&Video> = None; let mut caption_to_save: Option<&str> = None;
-    if let (Some(video), Some(caption)) = (msg.video(), msg.caption()) { video_to_save = Some(video); caption_to_save = Some(caption);
-    } else if let (Some(reply), Some(caption)) = (msg.reply_to_message(), msg.text()) { if let Some(video) = reply.video() { video_to_save = Some(video); caption_to_save = Some(caption); } }
+    let mut video_to_save: Option<&Video> = None;
+    let mut caption_to_save: Option<&str> = None;
+
+    if let (Some(video), Some(caption)) = (msg.video(), msg.caption()) {
+        video_to_save = Some(video);
+        caption_to_save = Some(caption);
+    } else if let (Some(reply), Some(caption)) = (msg.reply_to_message(), msg.text()) {
+        if let Some(video) = reply.video() {
+            video_to_save = Some(video);
+            caption_to_save = Some(caption);
+        }
+    }
+
     if let (Some(video), Some(caption)) = (video_to_save, caption_to_save) {
-        if sqlx::query("INSERT OR IGNORE INTO videos (file_id, caption) VALUES (?, ?)").bind(&video.file.id).bind(caption).execute(&pool).await.is_ok() {
-            bot.send_message(msg.chat.id, "✅ Video saved!").await?;
-        } else { bot.send_message(msg.chat.id, "❌ DB error.").await?; }
-    } else { bot.send_message(msg.chat.id, "Send a video with a caption or reply to a video to save it.").await?; }
+        let status_msg = bot.send_message(msg.chat.id, "⏳ Analyzing and saving video...").reply_to_message_id(msg.id).await?;
+
+        tokio::spawn(process_and_save_video(
+            bot.clone(),
+            msg.chat.id,
+            msg.id,
+            status_msg.id,
+            video.clone(),
+            caption.to_string(),
+            pool,
+        ));
+    } else {
+        bot.send_message(msg.chat.id, "Send a video with a caption or reply to a video with a new caption to save it.").await?;
+    }
     Ok(())
 }
 
