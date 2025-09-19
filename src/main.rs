@@ -15,7 +15,7 @@ use reqwest::Url;
 // --- Data Structures ---
 
 #[derive(Clone, Debug, sqlx::FromRow)]
-struct VideoData { caption: String, file_id: String }
+struct VideoData { caption: String, file_id: String, user_id: i64 }
 type SharedState = SqlitePool;
 
 #[derive(BotCommands, Clone)]
@@ -106,7 +106,7 @@ async fn main() {
     let bot = Bot::from_env();
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = SqlitePool::connect(&database_url).await.expect("Failed to connect to database");
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS videos (file_id TEXT PRIMARY KEY NOT NULL, caption TEXT NOT NULL)"#)
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS videos (file_id TEXT PRIMARY KEY NOT NULL, caption TEXT NOT NULL, user_id INTEGER NOT NULL)"#)
         .execute(&pool).await.expect("Failed to create database table");
 
     let handler = dptree::entry()
@@ -380,16 +380,38 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 // --- Bot Handlers ---
 
 async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState) -> Result<(), teloxide::RequestError> {
+    // We need the user's ID for the remove command, so get it early.
+    let Some(user) = msg.from() else {
+        // Can't process command without a user.
+        return Ok(());
+    };
+    let user_id = user.id;
+
     match cmd {
-        Command::Help => { bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?; }
+        Command::Help => {
+            bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?;
+        }
         Command::Remove => {
-            let videos: Vec<VideoData> = sqlx::query_as("SELECT file_id, caption FROM videos").fetch_all(&pool).await.unwrap_or_default();
-            if videos.is_empty() { bot.send_message(msg.chat.id, "You have no saved videos to remove.").await?; return Ok(()); }
+            // UPDATED QUERY: Select all columns and filter with a WHERE clause
+            let videos: Vec<VideoData> = sqlx::query_as("SELECT file_id, caption, user_id FROM videos WHERE user_id = ?")
+                .bind(user_id.0 as i64) // Bind the user's ID to the query
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+
+            if videos.is_empty() {
+                bot.send_message(msg.chat.id, "You have no saved videos to remove.").await?;
+                return Ok(());
+            }
+
             let keyboard_buttons: Vec<Vec<_>> = videos.into_iter().map(|video| {
-                let mut short_id = video.file_id; short_id.truncate(50);
+                // The file_id from telegram can be very long, truncate for the callback data
+                let mut short_id = video.file_id.clone();
+                short_id.truncate(50);
                 vec![InlineKeyboardButton::callback(video.caption, format!("delete_{}", short_id))]
             }).collect();
-            bot.send_message(msg.chat.id, "Select a video to remove:").reply_markup(InlineKeyboardMarkup::new(keyboard_buttons)).await?;
+
+            bot.send_message(msg.chat.id, "Select one of your videos to remove:").reply_markup(InlineKeyboardMarkup::new(keyboard_buttons)).await?;
         }
     }
     Ok(())
@@ -556,6 +578,7 @@ async fn process_and_save_video(
     video: Video,
     caption: String,
     pool: SharedState,
+    user_id: UserId
 ) {
     let temp_dir = match Builder::new().prefix("video_save").tempdir() {
         Ok(dir) => dir,
@@ -665,8 +688,14 @@ async fn process_and_save_video(
         }
     }
 
-    if sqlx::query("INSERT OR IGNORE INTO videos (file_id, caption) VALUES (?, ?)")
-        .bind(&final_file_id).bind(&caption).execute(&pool).await.is_ok()
+    let user_id_i64 = user_id.0 as i64;
+    if sqlx::query("INSERT OR IGNORE INTO videos (file_id, caption, user_id) VALUES (?, ?, ?)")
+        .bind(&final_file_id)
+        .bind(&caption)
+        .bind(user_id_i64) // <-- BIND the user_id
+        .execute(&pool)
+        .await
+        .is_ok()
     {
         bot.edit_message_text(chat_id, status_message_id, final_message_text).await.ok();
     } else {
@@ -674,9 +703,11 @@ async fn process_and_save_video(
     }
 }
 
+// Replace the existing handle_message function with this one
 async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(), teloxide::RequestError> {
     let mut video_to_save: Option<&Video> = None;
     let mut caption_to_save: Option<&str> = None;
+    let mut source_message_for_reply = &msg; // The message we should reply to
 
     if let (Some(video), Some(caption)) = (msg.video(), msg.caption()) {
         video_to_save = Some(video);
@@ -685,8 +716,15 @@ async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(),
         if let Some(video) = reply.video() {
             video_to_save = Some(video);
             caption_to_save = Some(caption);
+            source_message_for_reply = reply; // Reply to the original video message
         }
     }
+
+    // Ensure we have a user to attribute the save to
+    let Some(user) = msg.from() else {
+        // This can happen with anonymous messages in channels, ignore them.
+        return Ok(());
+    };
 
     if let (Some(video), Some(caption)) = (video_to_save, caption_to_save) {
         let status_msg = bot.send_message(msg.chat.id, "⏳ Analyzing and saving video...").reply_to_message_id(msg.id).await?;
@@ -694,11 +732,12 @@ async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(),
         tokio::spawn(process_and_save_video(
             bot.clone(),
             msg.chat.id,
-            msg.id,
+            source_message_for_reply.id, // Use the correct message to reply to
             status_msg.id,
             video.clone(),
             caption.to_string(),
             pool,
+            user.id
         ));
     } else {
         bot.send_message(msg.chat.id, "Send a video with a caption or reply to a video with a new caption to save it.").await?;
