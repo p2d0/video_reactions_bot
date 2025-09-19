@@ -92,6 +92,7 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     // --- 5. Sort, take the largest, and adjust coordinates back to original ---
     boxes.sort_by_key(|b| Reverse(b.width() * b.height()));
     boxes.into_iter()
+         .filter(|rect| rect.width() < original_width && rect.height() < original_height)
         .take(2)
         .map(|rect| BoundingBox {
             // Adjust coordinates to remove the padding offset
