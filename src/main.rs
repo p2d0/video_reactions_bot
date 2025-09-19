@@ -10,6 +10,7 @@ use std::env;
 // Imports for computer vision and inline editing.
 use image::io::Reader as ImageReader;
 use imageproc::{contours::{find_contours, Contour}, rect::Rect};
+use reqwest::Url;
 
 // --- Data Structures ---
 
@@ -179,7 +180,7 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
     let font_path = PathBuf::from(&font_path_str);
     let font_name = font_path.file_stem().and_then(|s| s.to_str()).unwrap_or("Noto Sans");
 
-    let mut ass_content: String;
+    let ass_content: String;
     let mut preliminary_filters: Vec<String> = vec![];
     let mut final_map_tag = "[0:v]".to_string();
 
@@ -442,45 +443,77 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
     let mut results = vec![];
 
     if let Some((search_term, edit_params_raw)) = q.query.split_once("/edit") {
-        let edit_params = edit_params_raw.trim();
-        let mut display_description = String::new();
+        let user_id = q.from.id;
+        // Check if we can actually send a message back to the user later.
+        let can_send_message = bot.send_chat_action(user_id, ChatAction::Typing).await.is_ok();
 
-        // Create a user-friendly description for the timed edit format.
-        if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
-            if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
-                if let Ok(time) = time_str.parse::<f64>() {
-                    display_description = format!("TEXT 1: '{}' | TEXT 2: '{}' (at {}s)", msg1.trim(), msg2.trim(), time);
+        if can_send_message {
+            // --- User has started the bot, proceed with edit logic ---
+            let edit_params = edit_params_raw.trim();
+            let mut display_description = String::new();
+
+            if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
+                if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
+                    if let Ok(time) = time_str.parse::<f64>() {
+                        display_description = format!("TEXT 1: '{}' | TEXT 2: '{}' (at {}s)", msg1.trim(), msg2.trim(), time);
+                    }
                 }
             }
-        }
 
-        // Fallback to existing description logic
-        if display_description.is_empty() {
-            if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
-                display_description = format!("BOX 1: '{}' | BOX 2: '{}'", msg1.trim(), msg2.trim());
-            } else {
-                display_description = format!("Click to replace text with: '{}'", edit_params);
+            if display_description.is_empty() {
+                if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
+                    display_description = format!("BOX 1: '{}' | BOX 2: '{}'", msg1.trim(), msg2.trim());
+                } else {
+                    display_description = format!("Click to replace text with: '{}'", edit_params);
+                }
+            }
+
+            let search_pattern = format!("%{}%", search_term.trim());
+            if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ? LIMIT 1")
+                .bind(search_pattern).fetch_optional(&pool).await.unwrap_or(None) {
+
+                    let mut file_id_prefix = video.file_id.clone();
+                    file_id_prefix.truncate(55);
+                    let result_id = format!("edit_{}", file_id_prefix);
+                    let dummy_keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]]);
+
+                    let result = InlineQueryResult::CachedVideo(
+                        InlineQueryResultCachedVideo::new(result_id, video.file_id, format!("EDIT: {}", video.caption))
+                        .description(display_description)
+                        .input_message_content(InputMessageContent::Text(InputMessageContentText::new("⚙️ Preparing your video...")))
+                        .reply_markup(dummy_keyboard)
+                    );
+                    results.push(result);
+                }
+        } else {
+            // --- User has NOT started the bot, show a prompt to start it ---
+            let me = bot.get_me().await?;
+            // FIX 1: Access the `username` FIELD, not a method. Use a reference.
+            if let Some(bot_username) = &me.username {
+                 let start_url_str = format!("https://t.me/{}?start=inline", bot_username);
+                 // FIX 2: Safely parse the string into a reqwest::Url
+                 if let Ok(start_url) = Url::parse(&start_url_str) {
+                     let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                         InlineKeyboardButton::url("Click here to Start Bot", start_url)
+                     ]]);
+
+                     let result = InlineQueryResult::Article(
+                         InlineQueryResultArticle::new(
+                             "start_bot_prompt", // Unique ID for this result
+                             "Bot Not Started",
+                             InputMessageContent::Text(InputMessageContentText::new(
+                                 "You need to start a chat with me before I can edit and send you videos."
+                             ))
+                         )
+                         .description("You must start the bot to use the edit feature.")
+                         .reply_markup(keyboard)
+                     );
+                     results.push(result.into());
+                 }
             }
         }
-
-        let search_pattern = format!("%{}%", search_term.trim());
-        if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ? LIMIT 1")
-            .bind(search_pattern).fetch_optional(&pool).await.unwrap_or(None) {
-
-                let mut file_id_prefix = video.file_id.clone();
-                file_id_prefix.truncate(55);
-                let result_id = format!("edit_{}", file_id_prefix);
-                let dummy_keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]]);
-
-                let result = InlineQueryResult::CachedVideo(
-                    InlineQueryResultCachedVideo::new(result_id, video.file_id, format!("EDIT: {}", video.caption))
-                    .description(display_description)
-                    .input_message_content(InputMessageContent::Text(InputMessageContentText::new("⚙️ Preparing your video...")))
-                    .reply_markup(dummy_keyboard)
-                );
-                results.push(result);
-            }
     } else {
+        // --- Standard search logic (no changes needed here) ---
         let videos: Vec<VideoData> = if q.query.is_empty() {
             sqlx::query_as("SELECT file_id, caption FROM videos LIMIT ? OFFSET ?")
                 .bind(PAGE_SIZE).bind(sql_offset).fetch_all(&pool).await.unwrap_or_default()
