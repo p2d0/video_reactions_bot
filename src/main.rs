@@ -15,7 +15,7 @@ use reqwest::Url;
 // --- Data Structures ---
 
 #[derive(Clone, Debug, sqlx::FromRow)]
-struct VideoData { caption: String, file_id: String, user_id: i64 }
+struct VideoData { caption: String, file_id: String }
 type SharedState = SqlitePool;
 
 #[derive(BotCommands, Clone)]
@@ -64,31 +64,35 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     let mut padded_image = image::GrayImage::new(original_width + PADDING * 2, original_height + PADDING * 2);
     image::imageops::replace(&mut padded_image, &original_luma, PADDING as i64, PADDING as i64);
 
-    const MIN_BOX_DIM_RATIO: f32 = 0.1;
-    let min_width = (original_width as f32 * MIN_BOX_DIM_RATIO) as u32;
-    let min_height = (original_height as f32 * MIN_BOX_DIM_RATIO) as u32;
+    const MIN_BOX_WIDTH_RATIO: f32 = 0.9;
+    const MIN_BOX_HEIGHT_RATIO: f32 = 0.15;
+    let min_width = (original_width as f32 * MIN_BOX_WIDTH_RATIO) as u32;
+    let min_height = (original_height as f32 * MIN_BOX_HEIGHT_RATIO) as u32;
 
     let white_binary_image = imageproc::map::map_pixels(&padded_image, |_, _, p| {
-        if p[0] > 250 { image::Luma([255]) } else { image::Luma([0]) }
+        if p[0] > 210 { image::Luma([255]) } else { image::Luma([0]) }
     });
     let contours = find_contours(&white_binary_image);
     let mut boxes = contours_to_bounding_boxes(&contours, min_width, min_height);
 
+    log::info!("Detected {} white boxes.", boxes.len());
     if boxes.is_empty() {
-        let black_binary_image = imageproc::map::map_pixels(&padded_image, |_, _, p| {
-            if p[0] < 5 { image::Luma([255]) } else { image::Luma([0]) }
+        log::info!("No white boxes found, trying black boxes.");
+        let black_binary_image = imageproc::map::map_pixels(&original_luma, |_, _, p| {
+            if p[0] < 1 { image::Luma([255]) } else { image::Luma([0]) }
         });
         let black_contours = find_contours(&black_binary_image);
         boxes = contours_to_bounding_boxes(&black_contours, min_width, min_height);
     }
-
+    log::info!("Detected {} boxes before filtering.", boxes.len());
+    log::info!("Boxes: {:?}", boxes);
     boxes.sort_by_key(|b| Reverse(b.width() * b.height()));
     boxes.into_iter()
          .filter(|rect| rect.height() < original_height)
         .take(2)
         .map(|rect| BoundingBox {
-            x: rect.left() - PADDING as i32,
-            y: rect.top() - PADDING as i32,
+            x: rect.left(),
+            y: rect.top(),
             w: rect.width(),
             h: rect.height(),
         })
@@ -648,12 +652,14 @@ async fn process_and_save_video(
                 let crop_start_y = (bbox.y as u32 + bbox.h + CROP_MARGIN).min(video_height);
                 let new_height = video_height - crop_start_y;
 
+                log::info!("Cropping top box at y={} with height={}", crop_start_y, new_height);
                 format!(
                     "[0:v]crop=w=in_w:h={h}:x=0:y={y}[v_out]",
                     h = new_height,
                     y = crop_start_y
                 )
             } else {
+                log::info!("Cropping bottom box at y={} with height={}", bbox.y, bbox.h);
                 let new_height = (bbox.y as u32).saturating_sub(CROP_MARGIN);
                 format!(
                     "[0:v]crop=w=in_w:h={h}:x=0:y=0[v_out]",
