@@ -64,13 +64,13 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     let mut padded_image = image::GrayImage::new(original_width + PADDING * 2, original_height + PADDING * 2);
     image::imageops::replace(&mut padded_image, &original_luma, PADDING as i64, PADDING as i64);
 
-    const MIN_BOX_WIDTH_RATIO: f32 = 0.9;
-    const MIN_BOX_HEIGHT_RATIO: f32 = 0.15;
+    const MIN_BOX_WIDTH_RATIO: f32 = 0.4;
+    const MIN_BOX_HEIGHT_RATIO: f32 = 0.1;
     let min_width = (original_width as f32 * MIN_BOX_WIDTH_RATIO) as u32;
     let min_height = (original_height as f32 * MIN_BOX_HEIGHT_RATIO) as u32;
 
     let white_binary_image = imageproc::map::map_pixels(&padded_image, |_, _, p| {
-        if p[0] > 210 { image::Luma([255]) } else { image::Luma([0]) }
+        if p[0] > 240 { image::Luma([255]) } else { image::Luma([0]) }
     });
     let contours = find_contours(&white_binary_image);
     let mut boxes = contours_to_bounding_boxes(&contours, min_width, min_height);
