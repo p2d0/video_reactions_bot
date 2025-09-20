@@ -212,17 +212,18 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
             preliminary_filters.push(filter);
             final_map_tag = current_tag; // The next filter will use the output of drawbox.
 
-            let font_size = (bbox.h as f32 * 0.1).max(10.0) as u32;
-            let center_x = bbox.x + (bbox.w as i32 / 2);
-            let center_y = bbox.y + (bbox.h as i32 / 2);
+            let font_size = (bbox.h as f32 * 0.3).max(20.0) as u32;
+            let margin_l = bbox.x;
+            let margin_r = width as i32 - (bbox.x + bbox.w as i32);
+            let margin_v = bbox.y + (bbox.h as f32 * 0.1) as i32;
 
             let event1 = format!(
-                r#"Dialogue: 0,0:00:00.00,{end_time},BoxStyle,,0,0,0,,{{\fs{fs}\pos({cx}, {cy})}}{text}"#,
-                end_time = end_time1_str, fs = font_size, cx = center_x, cy = center_y, text = ass_safe_text1
+                r#"Dialogue: 0,0:00:00.00,{end_time},BoxStyle,,{ml},{mr},{mv},,{{\fs{fs}}}{text}"#,
+                end_time = end_time1_str, ml = margin_l, mr = margin_r, mv = margin_v, fs = font_size, text = ass_safe_text1
             );
             let event2 = format!(
-                r#"Dialogue: 0,{start_time},9:59:59.99,BoxStyle,,0,0,0,,{{\fs{fs}\pos({cx}, {cy})}}{text}"#,
-                start_time = start_time2_str, fs = font_size, cx = center_x, cy = center_y, text = ass_safe_text2
+                r#"Dialogue: 0,{start_time},9:59:59.99,BoxStyle,,{ml},{mr},{mv},,{{\fs{fs}}}{text}"#,
+                start_time = start_time2_str, ml = margin_l, mr = margin_r, mv = margin_v, fs = font_size, text = ass_safe_text2
             );
 
             ass_content = format!(
@@ -231,7 +232,7 @@ PlayResX: {width}
 PlayResY: {height}
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: BoxStyle,{font_name},100,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1
+Style: BoxStyle,{font_name},100,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,8,10,10,10,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 {event1}
@@ -301,14 +302,17 @@ Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
             );
             preliminary_filters.push(filter);
             last_tag = current_tag;
+
             let text_to_draw = messages.get(i).unwrap_or(&messages[0]).trim();
-            let font_size = (bbox.h as f32 * 0.1).max(7.0) as u32;
-            let center_x = bbox.x + (bbox.w as i32 / 2);
-            let center_y = bbox.y + (bbox.h as i32 / 2);
+            let font_size = (bbox.h as f32 * 0.15).max(11.0) as u32;
             let ass_safe_text = text_to_draw.replace('{', "\\{").replace('}', "\\}");
+            let margin_l = bbox.x;
+            let margin_r = width as i32 - (bbox.x + bbox.w as i32);
+            let margin_v = bbox.y + (bbox.h as f32 * 0.1) as i32;
+
             let event = format!(
-                r#"Dialogue: 0,0:00:00.00,9:59:59.99,BoxStyle,,0,0,0,,{{\fs{fs}\pos({cx}, {cy})}}{text}"#,
-                fs = font_size, cx = center_x, cy = center_y, text = ass_safe_text
+                r#"Dialogue: 0,0:00:00.00,9:59:59.99,BoxStyle,,{ml},{mr},{mv},,{{\fs{fs}}}{text}"#,
+                ml = margin_l, mr = margin_r, mv = margin_v, fs = font_size, text = ass_safe_text
             );
             event_lines.push_str(&event);
             event_lines.push('\n');
@@ -320,7 +324,7 @@ PlayResX: {width}
 PlayResY: {height}
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: BoxStyle,{font_name},100,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1
+Style: BoxStyle,{font_name},100,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,8,10,10,10,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 {event_lines}"#,
