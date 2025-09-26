@@ -18,6 +18,12 @@ use reqwest::Url;
 struct VideoData { caption: String, file_id: String }
 type SharedState = SqlitePool;
 
+// A new struct to hold count result from SQL
+#[derive(sqlx::FromRow)]
+struct Count {
+    count: i64,
+}
+
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "These commands are supported:")]
 enum Command {
@@ -387,18 +393,72 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 // --- Bot Handlers ---
 
-// Replace your existing handle_command function with this one.
+const REMOVE_PAGE_SIZE: i64 = 8; // Define how many items to show per page
+
+/// **NEW HELPER FUNCTION**
+/// Builds the paginated inline keyboard for the remove command.
+async fn build_remove_keyboard(pool: &SharedState, user_id: UserId, page: i64) -> Result<Option<InlineKeyboardMarkup>, sqlx::Error> {
+    // First, get the total count of videos for this user
+    let total_count: i64 = sqlx::query_as::<_, Count>("SELECT COUNT(*) as count FROM videos WHERE user_id = ?")
+        .bind(user_id.0 as i64)
+        .fetch_one(pool)
+        .await?
+        .count;
+
+    if total_count == 0 {
+        return Ok(None); // No videos, so no keyboard
+    }
+
+    let total_pages = (total_count as f64 / REMOVE_PAGE_SIZE as f64).ceil() as i64;
+    // Ensure the page number is valid
+    let current_page = page.max(0).min(total_pages - 1);
+    let offset = current_page * REMOVE_PAGE_SIZE;
+
+    // Fetch the videos for the current page
+    let videos: Vec<VideoData> = sqlx::query_as("SELECT file_id, caption FROM videos WHERE user_id = ? ORDER BY rowid DESC LIMIT ? OFFSET ?")
+        .bind(user_id.0 as i64)
+        .bind(REMOVE_PAGE_SIZE)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+    // Build the video buttons for the current page
+    let mut keyboard_buttons: Vec<Vec<_>> = videos.into_iter().map(|video| {
+        let mut short_id = video.file_id.clone();
+        short_id.truncate(50);
+        // Pass the current page number in the callback data to allow refreshing the view
+        let callback_data = format!("delete_{}_{}", current_page, short_id);
+        vec![InlineKeyboardButton::callback(video.caption, callback_data)]
+    }).collect();
+
+    // Build the navigation row
+    let mut nav_row = Vec::new();
+    if current_page > 0 {
+        nav_row.push(InlineKeyboardButton::callback("⬅️ Previous", format!("remove_page_{}", current_page - 1)));
+    }
+    // Add a non-clickable page indicator
+    nav_row.push(InlineKeyboardButton::callback(format!("- {}/{} -", current_page + 1, total_pages), "ignore"));
+    if current_page < total_pages - 1 {
+        nav_row.push(InlineKeyboardButton::callback("Next ➡️", format!("remove_page_{}", current_page + 1)));
+    }
+
+    if !nav_row.is_empty() {
+        keyboard_buttons.push(nav_row);
+    }
+
+    Ok(Some(InlineKeyboardMarkup::new(keyboard_buttons)))
+}
+
+
+/// **REPLACED `handle_command`**
 async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState) -> Result<(), teloxide::RequestError> {
-    // We need the user's ID for the remove command, so get it early.
     let Some(user) = msg.from() else {
-        // Can't process command without a user.
         return Ok(());
     };
     let user_id = user.id;
 
     match cmd {
         Command::Help => {
-            // Combine the auto-generated descriptions with detailed inline usage instructions.
             let command_descriptions = Command::descriptions().to_string();
             let help_text = format!(
                 "{}\n\n*Inline Editing Guide*\n\n\
@@ -418,26 +478,18 @@ async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState)
             bot.send_message(msg.chat.id, help_text).parse_mode(ParseMode::MarkdownV2).await?;
         }
         Command::Remove => {
-            // UPDATED QUERY: Select all columns and filter with a WHERE clause
-            let videos: Vec<VideoData> = sqlx::query_as("SELECT file_id, caption, user_id FROM videos WHERE user_id = ?")
-                .bind(user_id.0 as i64) // Bind the user's ID to the query
-                .fetch_all(&pool)
-                .await
-                .unwrap_or_default();
-
-            if videos.is_empty() {
-                bot.send_message(msg.chat.id, "You have no saved videos to remove.").await?;
-                return Ok(());
+            match build_remove_keyboard(&pool, user_id, 0).await {
+                Ok(Some(keyboard)) => {
+                    bot.send_message(msg.chat.id, "Select a video to remove:").reply_markup(keyboard).await?;
+                }
+                Ok(None) => {
+                    bot.send_message(msg.chat.id, "You have no saved videos to remove.").await?;
+                }
+                Err(e) => {
+                    log::error!("Failed to build remove keyboard: {}", e);
+                    bot.send_message(msg.chat.id, "Error fetching your videos.").await?;
+                }
             }
-
-            let keyboard_buttons: Vec<Vec<_>> = videos.into_iter().map(|video| {
-                // The file_id from telegram can be very long, truncate for the callback data
-                let mut short_id = video.file_id.clone();
-                short_id.truncate(50);
-                vec![InlineKeyboardButton::callback(video.caption, format!("delete_{}", short_id))]
-            }).collect();
-
-            bot.send_message(msg.chat.id, "Select one of your videos to remove:").reply_markup(InlineKeyboardMarkup::new(keyboard_buttons)).await?;
         }
     }
     Ok(())
@@ -970,20 +1022,60 @@ async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(),
     Ok(())
 }
 
-async fn handle_callback_query(bot: Bot, q: CallbackQuery, pool: SharedState) -> Result<(), teloxide::RequestError> {
-    if let Some(data) = q.data {
-        if data == "ignore" {
-            bot.answer_callback_query(q.id).await?;
-            return Ok(());
-        }
 
-        if let Some(prefix) = data.strip_prefix("delete_") {
-            let pattern = format!("{}%", prefix);
-            if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE file_id LIKE ?")
-                .bind(&pattern).fetch_optional(&pool).await.unwrap_or(None) {
+/// **REPLACED `handle_callback_query`**
+async fn handle_callback_query(bot: Bot, q: CallbackQuery, pool: SharedState) -> Result<(), teloxide::RequestError> {
+    let Some(data) = q.data else { return Ok(()) };
+    let Some(message) = q.message else { return Ok(()) };
+    let user_id = q.from.id;
+
+    // Acknowledge the callback immediately to stop the loading icon
+    bot.answer_callback_query(q.id).await?;
+
+    if data == "ignore" {
+        return Ok(());
+    }
+
+    // Handle page navigation
+    if let Some(page_str) = data.strip_prefix("remove_page_") {
+        if let Ok(page) = page_str.parse::<i64>() {
+            // Rebuild the keyboard for the new page and edit the message
+            if let Ok(Some(keyboard)) = build_remove_keyboard(&pool, user_id, page).await {
+                bot.edit_message_reply_markup(message.chat.id, message.id).reply_markup(keyboard).await?;
+            }
+        }
+    }
+    // Handle video deletion
+    else if let Some(delete_data) = data.strip_prefix("delete_") {
+        // The format is "delete_{page}_{short_id}"
+        if let Some((page_str, prefix)) = delete_data.split_once('_') {
+            if let Ok(page) = page_str.parse::<i64>() {
+                let pattern = format!("{}%", prefix);
+                // Find the full video data to get the caption for the confirmation message
+                if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE file_id LIKE ? AND user_id = ?")
+                    .bind(&pattern)
+                    .bind(user_id.0 as i64)
+                    .fetch_optional(&pool).await.unwrap_or(None)
+                {
+                    // Delete the video from the database
                     sqlx::query("DELETE FROM videos WHERE file_id = ?").bind(&video.file_id).execute(&pool).await.ok();
-                    bot.answer_callback_query(q.id).await?;
-                    if let Some(m) = q.message { bot.edit_message_text(m.chat.id, m.id, format!("✅ Removed '{}'", video.caption)).await?; }
+                    let confirmation_text = format!("✅ Removed '{}'\n\nSelect another video to remove:", video.caption);
+
+                    // Refresh the keyboard to show the updated list
+                    match build_remove_keyboard(&pool, user_id, page).await {
+                        Ok(Some(keyboard)) => {
+                            bot.edit_message_text(message.chat.id, message.id, &confirmation_text).reply_markup(keyboard).await?;
+                        }
+                        Ok(None) => {
+                            // All videos have been deleted
+                            bot.edit_message_text(message.chat.id, message.id, "✅ All of your videos have been removed.").await?;
+                        }
+                        Err(e) => {
+                            log::error!("Failed to rebuild remove keyboard after deletion: {}", e);
+                            bot.edit_message_text(message.chat.id, message.id, "❌ Error refreshing video list.").await?;
+                        }
+                    }
+                }
             }
         }
     }
