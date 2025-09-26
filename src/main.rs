@@ -70,7 +70,7 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     let min_height = (original_height as f32 * MIN_BOX_HEIGHT_RATIO) as u32;
 
     let white_binary_image = imageproc::map::map_pixels(&padded_image, |_, _, p| {
-        if p[0] > 240 { image::Luma([255]) } else { image::Luma([0]) }
+        if p[0] > 220 { image::Luma([255]) } else { image::Luma([0]) }
     });
     let contours = find_contours(&white_binary_image);
     let mut boxes = contours_to_bounding_boxes(&contours, min_width, min_height);
@@ -79,7 +79,7 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     if boxes.is_empty() {
         log::info!("No white boxes found, trying black boxes.");
         let black_binary_image = imageproc::map::map_pixels(&original_luma, |_, _, p| {
-            if p[0] < 1 { image::Luma([255]) } else { image::Luma([0]) }
+            if p[0] < 3 { image::Luma([255]) } else { image::Luma([0]) }
         });
         let black_contours = find_contours(&black_binary_image);
         boxes = contours_to_bounding_boxes(&black_contours, min_width, min_height);
@@ -596,6 +596,172 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
     Ok(())
 }
 
+async fn download_and_process_video(
+    bot: Bot,
+    chat_id: ChatId,
+    user_message_id: MessageId,
+    status_message_id: MessageId,
+    url: String,
+    caption: String,
+    pool: SharedState,
+    user_id: UserId,
+) {
+    let temp_dir = match Builder::new().prefix("video_dl").tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::error!("Failed to create temp dir: {}", e);
+            let _ = bot.edit_message_text(chat_id, status_message_id, "❌ Error: Server failed to create temporary directory.").await;
+            return;
+        }
+    };
+    let temp_dir_path = temp_dir.path();
+    let output_template = temp_dir_path.join("video.mp4");
+
+    // Download video using yt-dlp
+    let ytdlp_status = tokio::process::Command::new("yt-dlp")
+        .arg("--output").arg(output_template)
+        .arg("--force-overwrite")
+        .arg("--format").arg("bv*[ext=mp4][filesize<10M]+ba[ext=m4a]/b[ext=mp4][filesize<10M]/bv*+ba/b")
+        .arg("--cookies").arg("./instacookie")
+        .arg("--remux-video").arg("mp4")
+        .arg(&url)
+        .status().await;
+
+    if !ytdlp_status.is_ok_and(|s| s.success()) {
+        log::error!("yt-dlp failed for url {}", &url);
+        bot.edit_message_text(chat_id, status_message_id, "❌ Error: Download failed. The link may be invalid or private.").await.ok();
+        return;
+    }
+
+    let input_path = temp_dir_path.join("video.mp4");
+    if !input_path.exists() {
+        bot.edit_message_text(chat_id, status_message_id, "❌ Error: Downloaded video file not found.").await.ok();
+        return;
+    }
+
+    let ffprobe_output = match tokio::process::Command::new("ffprobe")
+        .arg("-v").arg("error")
+        .arg("-select_streams").arg("v:0")
+        .arg("-show_entries").arg("stream=height")
+        .arg("-of").arg("csv=p=0")
+        .arg(&input_path)
+        .output().await {
+            Ok(out) => out,
+            Err(e) => {
+                log::error!("ffprobe failed: {}", e);
+                bot.edit_message_text(chat_id, status_message_id, "❌ Error: Could not analyze downloaded video.").await.ok();
+                return;
+            }
+        };
+
+    let video_height: u32 = String::from_utf8(ffprobe_output.stdout).unwrap_or_default().trim().parse().unwrap_or(0);
+    if video_height == 0 {
+        bot.edit_message_text(chat_id, status_message_id, "❌ Error: Could not determine video height from download.").await.ok();
+        return;
+    }
+
+    let output_path = temp_dir_path.join("output.mp4");
+    let frame_path = temp_dir_path.join("frame.png");
+
+    let final_file_id: String;
+    let final_message_text: String;
+
+    'processing_block: {
+        let frame_extraction_status = tokio::process::Command::new("ffmpeg")
+            .arg("-i").arg(&input_path).arg("-vframes").arg("1").arg(&frame_path).status().await.ok();
+
+        if frame_extraction_status.is_none() || !frame_extraction_status.unwrap().success() {
+            log::warn!("Failed to extract frame from downloaded video. Saving original.");
+            let sent = bot.send_video(chat_id, InputFile::file(&input_path)).caption(&caption).reply_to_message_id(user_message_id).await;
+            if let Ok(sent_message) = sent {
+                if let Some(video) = sent_message.video() {
+                    final_file_id = video.file.id.clone();
+                    final_message_text = "⚠️ Could not analyze video, saved original.".to_string();
+                } else {
+                    bot.edit_message_text(chat_id, status_message_id, "❌ Error: Telegram did not return video data after upload.").await.ok(); return;
+                }
+            } else {
+                bot.edit_message_text(chat_id, status_message_id, "❌ Error: Failed to upload processed video.").await.ok(); return;
+            }
+            break 'processing_block;
+        }
+
+        let detected_boxes = detect_white_or_black_boxes(&frame_path);
+
+        if detected_boxes.len() == 1 {
+            let bbox = &detected_boxes[0];
+            const CROP_MARGIN: u32 = 2;
+            let is_top_box = (bbox.y as u32 + bbox.h / 2) < (video_height / 2);
+            let filter_complex = if is_top_box {
+                let crop_start_y = (bbox.y as u32 + bbox.h + CROP_MARGIN).min(video_height);
+                let new_height = video_height - crop_start_y;
+                format!("[0:v]crop=w=in_w:h={h}:x=0:y={y}[v_out]", h = new_height, y = crop_start_y)
+            } else {
+                let new_height = (bbox.y as u32).saturating_sub(CROP_MARGIN);
+                format!("[0:v]crop=w=in_w:h={h}:x=0:y=0[v_out]", h = new_height)
+            };
+
+            let mut command = tokio::process::Command::new("ffmpeg");
+            command.arg("-i").arg(&input_path)
+                   .arg("-filter_complex").arg(&filter_complex)
+                   .arg("-map").arg("[v_out]").arg("-map").arg("0:a?").arg("-c:a").arg("copy");
+            let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
+            if !encoder.is_empty() { command.arg("-c:v").arg(&encoder); }
+            else if env::var("CUDA_ENABLED").is_ok() { command.arg("-c:v").arg("h264_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0"); }
+            else { command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast"); }
+            command.arg("-flags").arg("+global_header").arg("-movflags").arg("+faststart").arg("-pix_fmt").arg("yuv420p").arg(&output_path);
+
+            if command.status().await.is_ok_and(|s| s.success()) {
+                let sent = bot.send_video(chat_id, InputFile::file(&output_path)).caption(&caption).reply_to_message_id(user_message_id).await;
+                 if let Ok(sent_message) = sent {
+                    if let Some(video) = sent_message.video() {
+                        final_file_id = video.file.id.clone();
+                        final_message_text = "✅ Video cropped and saved!".to_string();
+                    } else {
+                        bot.edit_message_text(chat_id, status_message_id, "❌ Error: Telegram did not return video data after upload.").await.ok(); return;
+                    }
+                } else {
+                    bot.edit_message_text(chat_id, status_message_id, "❌ Error: Failed to upload processed video.").await.ok(); return;
+                }
+            } else {
+                log::warn!("ffmpeg crop failed for downloaded video. Saving original.");
+                let sent = bot.send_video(chat_id, InputFile::file(&input_path)).caption(&caption).reply_to_message_id(user_message_id).await;
+                if let Ok(sent_message) = sent {
+                    if let Some(video) = sent_message.video() {
+                        final_file_id = video.file.id.clone();
+                        final_message_text = "⚠️ Video processing failed, saved original.".to_string();
+                    } else {
+                        bot.edit_message_text(chat_id, status_message_id, "❌ Error: Telegram did not return video data after upload.").await.ok(); return;
+                    }
+                } else {
+                    bot.edit_message_text(chat_id, status_message_id, "❌ Error: Failed to upload original video.").await.ok(); return;
+                }
+            }
+        } else {
+            let sent = bot.send_video(chat_id, InputFile::file(&input_path)).caption(&caption).reply_to_message_id(user_message_id).await;
+            if let Ok(sent_message) = sent {
+                if let Some(video) = sent_message.video() {
+                    final_file_id = video.file.id.clone();
+                    final_message_text = if detected_boxes.is_empty() { "✅ Video saved! (No removable box was detected)".to_string() } else { format!("✅ Video saved! ({} boxes detected, expected 1 for cropping)", detected_boxes.len()) };
+                } else {
+                    bot.edit_message_text(chat_id, status_message_id, "❌ Error: Telegram did not return video data after upload.").await.ok(); return;
+                }
+            } else {
+                bot.edit_message_text(chat_id, status_message_id, "❌ Error: Failed to upload original video.").await.ok(); return;
+            }
+        }
+    }
+
+    let user_id_i64 = user_id.0 as i64;
+    if sqlx::query("INSERT OR IGNORE INTO videos (file_id, caption, user_id) VALUES (?, ?, ?)")
+        .bind(&final_file_id).bind(&caption).bind(user_id_i64).execute(&pool).await.is_ok()
+    {
+        bot.edit_message_text(chat_id, status_message_id, final_message_text).await.ok();
+    } else {
+        bot.edit_message_text(chat_id, status_message_id, "❌ DB error while saving video.").await.ok();
+    }
+}
+
 async fn process_and_save_video(
     bot: Bot,
     chat_id: ChatId,
@@ -767,6 +933,37 @@ async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(),
             pool,
             user.id
         ));
+    } else if let Some(text) = msg.text() {
+        let maybe_url = text.split_whitespace().find(|s| {
+            s.contains("douyin.com") || s.contains("vk.com") ||
+            s.contains("youtube.com/clip/") || s.contains("youtube.com/shorts/") ||
+            s.contains("instagram.com/reel/") || s.contains("bsky.app") ||
+            s.contains("x.com/") || s.contains("twitter.com/") ||
+            s.contains("reddit.com/") || s.contains("tiktok.com")
+        });
+
+        if let Some(url) = maybe_url {
+            let caption = text.replace(url, "").trim().to_string();
+            if caption.is_empty() {
+                bot.send_message(msg.chat.id, "Please provide a caption for the video link.").await?;
+                return Ok(());
+            }
+
+            let status_msg = bot.send_message(msg.chat.id, "⏳ Downloading and saving video...").reply_to_message_id(msg.id).await?;
+
+            tokio::spawn(download_and_process_video(
+                bot.clone(),
+                msg.chat.id,
+                msg.id,
+                status_msg.id,
+                url.to_string(),
+                caption,
+                pool,
+                user.id,
+            ));
+        } else {
+            bot.send_message(msg.chat.id, "Send a video with a caption or reply to a video with a new caption to save it.").await?;
+        }
     } else {
         bot.send_message(msg.chat.id, "Send a video with a caption or reply to a video with a new caption to save it.").await?;
     }
