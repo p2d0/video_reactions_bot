@@ -498,37 +498,39 @@ async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState)
 async fn handle_chosen_inline_result(bot: Bot, chosen: ChosenInlineResult, pool: SharedState) -> Result<(), teloxide::RequestError> {
     let Some(inline_message_id) = chosen.inline_message_id else { return Ok(()) };
 
-    if let Some(file_id_prefix) = chosen.result_id.strip_prefix("edit_") {
-        let pattern = format!("{}%", file_id_prefix);
-        if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE file_id LIKE ?")
-            .bind(pattern).fetch_optional(&pool).await.unwrap_or(None) {
+    // We only need to trigger the video edit process if the command was "/edit".
+    // For "/caption", Telegram handles sending the video with the caption automatically.
+    if chosen.query.contains("/edit") {
+        if let Some(file_id_prefix) = chosen.result_id.strip_prefix("edit_") {
+            let pattern = format!("{}%", file_id_prefix);
+            if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE file_id LIKE ?")
+                .bind(pattern).fetch_optional(&pool).await.unwrap_or_default()
+            {
+                if let Some((_, edit_params_raw)) = chosen.query.split_once("/edit") {
+                    let edit_params = edit_params_raw.trim();
+                    let mut final_edit_text = String::new();
 
-            if let Some((_, edit_params_raw)) = chosen.query.split_once("/edit") {
-                let edit_params = edit_params_raw.trim();
-                let mut final_edit_text = String::new();
-
-                // Parse for timed edit format first: `text1 /time text2`
-                if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
-                    if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
-                        if time_str.parse::<f64>().is_ok() {
-                            final_edit_text = format!("{}///{}///{}", msg1.trim(), time_str.trim(), msg2.trim());
+                    if let Some((msg1, rest)) = edit_params.rsplit_once('/') {
+                        if let Some((time_str, msg2)) = rest.trim().split_once(' ') {
+                            if time_str.parse::<f64>().is_ok() {
+                                final_edit_text = format!("{}///{}///{}", msg1.trim(), time_str.trim(), msg2.trim());
+                            }
                         }
                     }
-                }
 
-                // Fallback to other formats if timed edit was not parsed
-                if final_edit_text.is_empty() {
-                    if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
-                        final_edit_text = format!("{}///{}", msg1.trim(), msg2.trim());
-                    } else {
-                        final_edit_text = edit_params.to_string();
+                    if final_edit_text.is_empty() {
+                        if let Some((msg1, msg2)) = edit_params.split_once("/box2") {
+                            final_edit_text = format!("{}///{}", msg1.trim(), msg2.trim());
+                        } else {
+                            final_edit_text = edit_params.to_string();
+                        }
                     }
-                }
 
-                let user_id = chosen.from.id;
-                tokio::spawn(perform_video_edit(
-                    bot.clone(), user_id, inline_message_id, video.file_id, final_edit_text,
-                ));
+                    let user_id = chosen.from.id;
+                    tokio::spawn(perform_video_edit(
+                        bot.clone(), user_id, inline_message_id, video.file_id, final_edit_text,
+                    ));
+                }
             }
         }
     }
@@ -543,12 +545,11 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
     let mut results = vec![];
 
     if let Some((search_term, edit_params_raw)) = q.query.split_once("/edit") {
+        // --- THIS IS THE EXISTING /edit LOGIC (NO CHANGES HERE) ---
         let user_id = q.from.id;
-        // Check if we can actually send a message back to the user later.
         let can_send_message = bot.send_chat_action(user_id, ChatAction::Typing).await.is_ok();
 
         if can_send_message {
-            // --- User has started the bot, proceed with edit logic ---
             let edit_params = edit_params_raw.trim();
             let mut display_description = String::new();
 
@@ -570,23 +571,22 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
 
             let search_pattern = format!("%{}%", search_term.trim());
             if let Some(video) = sqlx::query_as::<_, VideoData>("SELECT file_id, caption FROM videos WHERE caption LIKE ? LIMIT 1")
-                .bind(search_pattern).fetch_optional(&pool).await.unwrap_or(None) {
+                .bind(search_pattern).fetch_optional(&pool).await.unwrap_or_default() {
 
-                    let mut file_id_prefix = video.file_id.clone();
-                    file_id_prefix.truncate(55);
-                    let result_id = format!("edit_{}", file_id_prefix);
-                    let dummy_keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]]);
+                let mut file_id_prefix = video.file_id.clone();
+                file_id_prefix.truncate(55);
+                let result_id = format!("edit_{}", file_id_prefix);
+                let dummy_keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("⚙️ Processing...", "ignore")]]);
 
-                    let result = InlineQueryResult::CachedVideo(
-                        InlineQueryResultCachedVideo::new(result_id, video.file_id, format!("EDIT: {}", video.caption))
-                        .description(display_description)
-                        .input_message_content(InputMessageContent::Text(InputMessageContentText::new("⚙️ Preparing your video...")))
-                        .reply_markup(dummy_keyboard)
-                    );
-                    results.push(result);
-                }
+                let result = InlineQueryResult::CachedVideo(
+                    InlineQueryResultCachedVideo::new(result_id, video.file_id, format!("EDIT: {}", video.caption))
+                    .description(display_description)
+                    .input_message_content(InputMessageContent::Text(InputMessageContentText::new("⚙️ Preparing your video...")))
+                    .reply_markup(dummy_keyboard)
+                );
+                results.push(result);
+            }
         } else {
-            // --- User has NOT started the bot, show a prompt to start it ---
             let me = bot.get_me().await?;
             if let Some(bot_username) = &me.username {
                  let start_url_str = format!("https://t.me/{}?start=inline", bot_username);
@@ -594,10 +594,9 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
                      let keyboard = InlineKeyboardMarkup::new(vec![vec![
                          InlineKeyboardButton::url("Click here to Start Bot", start_url)
                      ]]);
-
                      let result = InlineQueryResult::Article(
                          InlineQueryResultArticle::new(
-                             "start_bot_prompt", // Unique ID for this result
+                             "start_bot_prompt",
                              "Bot Not Started",
                              InputMessageContent::Text(InputMessageContentText::new(
                                  "You need to start a chat with me before I can edit and send you videos."
@@ -610,6 +609,29 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
                  }
             }
         }
+    } else if let Some((search_term, caption_raw)) = q.query.split_once("/caption") {
+        // --- NEW LOGIC FOR THE /caption COMMAND ---
+        let new_caption = caption_raw.trim().to_string();
+        let search_pattern = format!("%{}%", search_term.trim());
+
+        let videos: Vec<VideoData> = sqlx::query_as("SELECT file_id, caption FROM videos WHERE caption LIKE ? LIMIT ? OFFSET ?")
+            .bind(&search_pattern)
+            .bind(PAGE_SIZE)
+            .bind(sql_offset)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+
+        results = videos.into_iter().map(|video| {
+            let mut result_id = video.file_id.clone();
+            result_id.truncate(60);
+            // Create a cached video result, but this time, we set the caption directly.
+            InlineQueryResult::CachedVideo(
+                InlineQueryResultCachedVideo::new(result_id, video.file_id, video.caption)
+                .caption(new_caption.clone()) // Set the new caption here
+            )
+        }).collect();
+
     } else {
         // --- Standard search logic (no changes needed here) ---
         let videos: Vec<VideoData> = if q.query.is_empty() {
@@ -621,7 +643,7 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
                 .bind(pattern).bind(PAGE_SIZE).bind(sql_offset).fetch_all(&pool).await.unwrap_or_default()
         };
 
-        results = videos.into_iter().enumerate().map(|(_, video)| {
+        results = videos.into_iter().map(|video| {
             let mut result_id = video.file_id.clone();
             result_id.truncate(60);
             InlineQueryResult::CachedVideo(InlineQueryResultCachedVideo::new(result_id, video.file_id, video.caption.clone()))
@@ -639,7 +661,8 @@ async fn handle_inline_query(bot: Bot, q: InlineQuery, pool: SharedState) -> Res
         answer = answer.next_offset(offset);
     }
 
-    if q.query.contains("/edit") {
+    // Ensure edit and caption queries are not cached by Telegram clients
+    if q.query.contains("/edit") || q.query.contains("/caption") {
         answer = answer.cache_time(0);
     }
 
