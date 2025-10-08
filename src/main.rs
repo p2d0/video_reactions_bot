@@ -138,6 +138,31 @@ fn format_ass_time(seconds: f64) -> String {
     format!("{}:{:02}:{:02}.{:02}", hours, minutes, secs, centiseconds)
 }
 
+fn configure_ffmpeg_encoder(command: &mut tokio::process::Command) {
+    // Check if the "bad hardware" flag is set.
+    if env::var("BAD_HARDWARE").is_ok_and(|v| v == "1") {
+        log::info!("BAD_HARDWARE flag detected. Using CPU-optimized FFMPEG settings for slow hardware.");
+        command.arg("-c:v").arg("libx264")
+               .arg("-preset").arg("ultrafast")
+               .arg("-crf").arg("26") // Lower quality for a significant speed boost
+               .arg("-threads").arg("4"); // Limit threads for low-core CPUs
+    } else {
+        // Standard hardware logic
+        let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
+        if !encoder.is_empty() {
+            command.arg("-c:v").arg(&encoder);
+        } else if env::var("CUDA_ENABLED").is_ok() {
+            command.arg("-c:v").arg("h264_nvenc")
+                   .arg("-preset").arg("p7")
+                   .arg("-rc").arg("vbr")
+                   .arg("-gpu").arg("0");
+        } else {
+            command.arg("-c:v").arg("libx264")
+                   .arg("-preset").arg("ultrafast");
+        }
+    }
+}
+
 // --- Background Video Editing Task ---
 
 async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String, file_id: String, text_parts: String) {
@@ -207,16 +232,14 @@ async fn perform_video_edit(bot: Bot, user_id: UserId, inline_message_id: String
         let ass_safe_text2 = text2.replace('{', "\\{").replace('}', "\\}");
 
         if let Some(bbox) = detected_boxes.get(0) {
-            // Case 1: Timed edit inside a detected box.
-            // **FIX**: Add the drawbox filter to fill the box with white first.
             let current_tag = "[v_box]".to_string();
             let filter = format!(
                 "{last_tag}drawbox=x={x}:y={y}:w={w}:h={h}:color=white:t=fill{out}",
-                last_tag = &final_map_tag, // Starts as "[0:v]"
+                last_tag = &final_map_tag,
                 x = bbox.x, y = bbox.y, w = bbox.w, h = bbox.h, out = &current_tag
             );
             preliminary_filters.push(filter);
-            final_map_tag = current_tag; // The next filter will use the output of drawbox.
+            final_map_tag = current_tag;
 
             let font_size = (bbox.h as f32 * 0.3).max(20.0) as u32;
             let margin_l = bbox.x;
@@ -246,7 +269,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 width = width, height = height, font_name = font_name, event1 = event1, event2 = event2
             );
         } else {
-            // Case 2: Timed edit, but no box detected. Fallback to padding.
             let pad_height = (height as f32 * 0.15).max(100.0) as u32;
             let font_size = (pad_height as f32 * 0.4).max(30.0) as u32;
             let v_margin = (pad_height as f32 * 0.25) as u32;
@@ -270,7 +292,6 @@ Dialogue: 0,{start_time2},9:59:59.99,Caption,,0,0,0,,{text2}"#,
             );
         }
     } else if detected_boxes.is_empty() {
-        // Case 3: Non-timed edit, no boxes found. Pad the video.
         let full_text = messages.join("\\N").trim().to_string();
         if full_text.is_empty() {
              bot.edit_message_text_inline(&inline_message_id, "❌ Error: No text provided to add to video.").await.ok();
@@ -297,8 +318,7 @@ Dialogue: 0,0:00:00.00,9:59:59.99,Caption,,0,0,0,,{text}"#,
             v_margin = v_margin, text = full_text.replace('{', "\\{").replace('}', "\\}")
         );
     } else {
-        // Case 4: Non-timed edit, boxes found. Fill boxes with text.
-        let mut last_tag = final_map_tag; // Starts as "[0:v]"
+        let mut last_tag = final_map_tag;
         let mut event_lines = String::new();
         for (i, bbox) in detected_boxes.iter().take(messages.len()).enumerate() {
             let current_tag = format!("[v{}]", i);
@@ -347,8 +367,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     let escaped_ass_path = ass_path.to_string_lossy().replace('\\', "/");
 
     let final_filter_chain = if preliminary_filters.is_empty() {
-         // This case should now only be hit if there are no boxes AND it's not a timed edit (which pads).
-         // Adding it for robustness, but the logic flows should mean it's rarely, if ever, used.
         format!("[0:v]subtitles=filename='{subs_path}', format=yuv420p[v_out]", subs_path = escaped_ass_path)
     } else {
         let prelim_chain = preliminary_filters.join(";");
@@ -362,14 +380,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     command.arg("-i").arg(&input_path).arg("-filter_complex").arg(&final_filter_chain)
         .arg("-map").arg("[v_out]").arg("-map").arg("0:a?").arg("-c:a").arg("copy");
 
-    let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
-    if !encoder.is_empty() {
-        command.arg("-c:v").arg(&encoder);
-    } else if env::var("CUDA_ENABLED").is_ok() {
-        command.arg("-c:v").arg("h264_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0");
-    } else {
-        command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast");
-    }
+    // MODIFIED PART: Use the new helper function to set encoder options
+    configure_ffmpeg_encoder(&mut command);
+
     command.arg("-flags").arg("+global_header").arg("-movflags").arg("+faststart").arg("-pix_fmt").arg("yuv420p").arg(&output_path);
 
     if command.status().await.is_ok_and(|s| s.success()) {
@@ -450,7 +463,6 @@ async fn build_remove_keyboard(pool: &SharedState, user_id: UserId, page: i64) -
 }
 
 
-/// **REPLACED `handle_command`**
 async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState) -> Result<(), teloxide::RequestError> {
     let Some(user) = msg.from() else {
         return Ok(());
@@ -460,18 +472,24 @@ async fn handle_command(bot: Bot, msg: Message, cmd: Command, pool: SharedState)
     match cmd {
         Command::Help => {
             let command_descriptions = Command::descriptions().to_string();
+            // Updated help text to include the new /caption command and clarify usage
             let help_text = format!(
-                "{}\n\n*Inline Editing Guide*\n\n\
-                To edit a video, type the bot's username in any chat, followed by a search for your saved video, then use `/edit`\n\n\
-                *Examples:*\n\
+                "{}\n\n*Inline Usage Guide*\n\n\
+                To use the bot in any chat, type its username, search for your video, then use a command like `/edit` or `/caption`\\.\n\n\
+                *Commands & Examples:*\n\n\
+                *1\\. Add a New Caption \\(`/caption`\\):*\n\
+                Sends the video instantly with your new text as the Telegram caption\\. The video itself is not modified\\.\n\
+                `@bot_username cat video /caption A cool new caption`\n\n\
+                *2\\. Edit Video Text \\(`/edit`\\):*\n\
+                Burns new text *into* the video file\\. This takes time to process\\.\n\
                 `@bot_username cat video /edit New funny text`\n\n\
-                *Advanced Formats:*\n\n\
-                *1 Two\\-Box Edit:*\n\
-                Provide text for the top two detected boxes using `/box2`\n\
-                `@bot_username /edit Top Text /box2 Bottom Text`\n\n\
-                *2 Timed Text Edit:*\n\
-                Change the text in the first detected box at a specific time\n\
-                `@bot_username /edit Text Before /55 Text After`",
+                *Advanced Editing Formats \\(for /edit\\):*\n\n\
+                *a\\) Two\\-Box Edit:*\n\
+                Provide text for the top two detected boxes using `/box2`\\.\n\
+                `@bot_username cat video /edit Top Text /box2 Bottom Text`\n\n\
+                *b\\) Timed Text Edit:*\n\
+                Change text at a specific time \\(in seconds\\)\\.\n\
+                `@bot_username cat video /edit Text Before /5.5 Text After`",
                 command_descriptions
             );
 
@@ -692,7 +710,6 @@ async fn download_and_process_video(
     let temp_dir_path = temp_dir.path();
     let output_template = temp_dir_path.join("video.mp4");
 
-    // Download video using yt-dlp
     let ytdlp_status = tokio::process::Command::new("yt-dlp")
         .arg("--output").arg(output_template)
         .arg("--force-overwrite")
@@ -780,10 +797,10 @@ async fn download_and_process_video(
             command.arg("-i").arg(&input_path)
                    .arg("-filter_complex").arg(&filter_complex)
                    .arg("-map").arg("[v_out]").arg("-map").arg("0:a?").arg("-c:a").arg("copy");
-            let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
-            if !encoder.is_empty() { command.arg("-c:v").arg(&encoder); }
-            else if env::var("CUDA_ENABLED").is_ok() { command.arg("-c:v").arg("h264_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0"); }
-            else { command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast"); }
+
+            // MODIFIED PART: Use the new helper function to set encoder options
+            configure_ffmpeg_encoder(&mut command);
+
             command.arg("-flags").arg("+global_header").arg("-movflags").arg("+faststart").arg("-pix_fmt").arg("yuv420p").arg(&output_path);
 
             if command.status().await.is_ok_and(|s| s.success()) {
@@ -919,10 +936,8 @@ async fn process_and_save_video(
                    .arg("-map").arg("0:a?")
                    .arg("-c:a").arg("copy");
 
-            let encoder = env::var("FFMPEG_ENCODER").unwrap_or_default();
-            if !encoder.is_empty() { command.arg("-c:v").arg(&encoder); }
-            else if env::var("CUDA_ENABLED").is_ok() { command.arg("-c:v").arg("h264_nvenc").arg("-preset").arg("p7").arg("-rc").arg("vbr").arg("-gpu").arg("0"); }
-            else { command.arg("-c:v").arg("libx264").arg("-preset").arg("ultrafast"); }
+            // MODIFIED PART: Use the new helper function to set encoder options
+            configure_ffmpeg_encoder(&mut command);
 
             command.arg("-flags").arg("+global_header").arg("-movflags").arg("+faststart").arg("-pix_fmt").arg("yuv420p").arg(&output_path);
 
@@ -961,7 +976,7 @@ async fn process_and_save_video(
     if sqlx::query("INSERT OR IGNORE INTO videos (file_id, caption, user_id) VALUES (?, ?, ?)")
         .bind(&final_file_id)
         .bind(&caption)
-        .bind(user_id_i64) // <-- BIND the user_id
+        .bind(user_id_i64)
         .execute(&pool)
         .await
         .is_ok()
