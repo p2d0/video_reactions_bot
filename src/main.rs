@@ -836,8 +836,12 @@ async fn autocrop_and_upload_video(
             .arg("-i").arg(input_path).arg("-vf").arg("select='eq(n,0)'")
             .arg("-vframes").arg("1").arg("-y").arg(&frame_a_path).status().await.ok();
 
+        // MODIFIED: Calculate a timestamp for a frame near the end of the video.
+        // This is more reliable for detecting persistent borders than using two early frames.
+        let frame_b_timestamp = duration - 1.0;
         let frame_b_status = tokio::process::Command::new("ffmpeg")
-            .arg("-ss").arg("1").arg("-i").arg(input_path)
+            .arg("-ss").arg(frame_b_timestamp.to_string())
+            .arg("-i").arg(input_path)
             .arg("-vframes").arg("1").arg("-y").arg(&frame_b_path).status().await.ok();
 
         if frame_a_status.is_some_and(|s| s.success()) && frame_b_status.is_some_and(|s| s.success()) {
