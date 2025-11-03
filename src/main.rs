@@ -82,6 +82,7 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
     });
     let contours = find_contours(&white_binary_image);
     let mut boxes = contours_to_bounding_boxes(&contours, min_width, min_height);
+    log::info!("Detected {} white boxes.", boxes.len());
 
     if boxes.is_empty() {
         let black_binary_image = imageproc::map::map_pixels(&original_luma, |_, _, p| {
@@ -90,6 +91,9 @@ fn detect_white_or_black_boxes(image_path: &Path) -> Vec<BoundingBox> {
         let black_contours = find_contours(&black_binary_image);
         boxes = contours_to_bounding_boxes(&black_contours, min_width, min_height);
     }
+
+    log::info!("Detected {} black boxes.", boxes.len());
+
     boxes.sort_by_key(|b| Reverse(b.width() * b.height()));
     boxes.into_iter()
          .filter(|rect| rect.height() < original_height)
