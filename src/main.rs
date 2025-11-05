@@ -993,7 +993,170 @@ async fn process_and_save_video(
     }
 }
 
+// --- Background task for the green screen feature ---
+async fn create_doakes_video(
+    bot: Bot,
+    chat_id: ChatId,
+    user_message_id: MessageId,
+    photo_file_id: String,
+) {
+    let status_msg = match bot.send_message(chat_id, "⏳ Surprise is coming...").reply_to_message_id(user_message_id).await {
+        Ok(msg) => msg,
+        Err(e) => {
+            log::error!("Failed to send status message: {}", e);
+            return;
+        }
+    };
+
+    // 1. Set up paths
+    let doakes_path = Path::new("./doakes.mp4");
+    if !doakes_path.exists() {
+        log::error!("'./doakes.mp4' not found in the program directory.");
+        bot.edit_message_text(chat_id, status_msg.id, "❌ Error: The 'doakes.mp4' video file is missing on the server.").await.ok();
+        return;
+    }
+
+    let temp_dir = match Builder::new().prefix("greenscreen").tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::error!("Failed to create temp dir: {}", e);
+            bot.edit_message_text(chat_id, status_msg.id, "❌ Error: Server failed to create temporary directory.").await.ok();
+            return;
+        }
+    };
+    let temp_dir_path = temp_dir.path();
+    let photo_path = temp_dir_path.join("user_photo.jpg");
+    let output_path = temp_dir_path.join("output.mp4");
+
+    // 2. Download the user's photo
+    let file = match bot.get_file(&photo_file_id).await {
+        Ok(f) => f,
+        Err(_) => {
+            bot.edit_message_text(chat_id, status_msg.id, "❌ Error: Failed to get photo info.").await.ok();
+            return;
+        }
+    };
+    let mut dest = match fs::File::create(&photo_path).await {
+        Ok(d) => d,
+        Err(_) => {
+             bot.edit_message_text(chat_id, status_msg.id, "❌ Error: Could not create temporary file for photo.").await.ok();
+             return;
+        }
+    };
+    if bot.download_file(&file.path, &mut dest).await.is_err() {
+        bot.edit_message_text(chat_id, status_msg.id, "❌ Error: Failed to download photo.").await.ok();
+        return;
+    };
+
+    // 3. Get video dimensions with ffprobe
+    let ffprobe_output = match tokio::process::Command::new("ffprobe")
+        .arg("-v").arg("error")
+        .arg("-select_streams").arg("v:0")
+        .arg("-show_entries").arg("stream=width,height")
+        .arg("-of").arg("csv=p=0:s=x")
+        .arg(doakes_path)
+        .output().await {
+            Ok(out) => out,
+            Err(e) => {
+                log::error!("ffprobe failed for doakes.mp4: {}", e);
+                bot.edit_message_text(chat_id, status_msg.id, "❌ Error: Could not analyze video dimensions.").await.ok();
+                return;
+            }
+        };
+
+    let dims_str = String::from_utf8(ffprobe_output.stdout).unwrap_or_default();
+    let dims: Vec<u32> = dims_str.trim().split('x').filter_map(|s| s.parse().ok()).collect();
+    let (width, height) = if dims.len() == 2 { (dims[0], dims[1]) } else {
+        log::error!("Could not parse dimensions from ffprobe output: {}", dims_str);
+        bot.edit_message_text(chat_id, status_msg.id, "❌ Error: Failed to determine video dimensions.").await.ok();
+        return;
+    };
+
+    // 4. Run ffmpeg command - *** THIS IS THE CORRECTED PART ***
+
+    // The `shortest=1` option is removed from the overlay filter itself.
+    let filter_complex = format!(
+        "[1:v]scale={w}:{h},setsar=1[bg]; \
+         [0:v]chromakey=0x00ff2b:similarity=0.12:blend=0.08[fg]; \
+         [bg][fg]overlay[outv]",
+        w = width, h = height
+    );
+
+    bot.edit_message_text(chat_id, status_msg.id, "⏳ Applying green screen magic...").await.ok();
+
+    // Instead of using `shortest` in the filter, we use it as a top-level flag.
+    // This is more reliable for preventing timestamp issues that create unplayable files.
+    let ffmpeg_status = tokio::process::Command::new("ffmpeg")
+        .arg("-i").arg(doakes_path)
+        .arg("-loop").arg("1")
+        .arg("-i").arg(&photo_path)
+        .arg("-filter_complex").arg(&filter_complex)
+        .arg("-map").arg("[outv]")
+        .arg("-map").arg("0:a?")
+        .arg("-c:a").arg("copy")
+        .arg("-c:v").arg("libx264")         // Explicitly set a compatible video codec
+        .arg("-preset").arg("veryfast")     // Good speed/quality balance for a bot
+        .arg("-pix_fmt").arg("yuv420p")      // Crucial for compatibility on most devices
+        .arg("-shortest")                   // End encoding when the shortest input (the video) ends
+        .arg("-y").arg(&output_path)        // Overwrite output if it exists
+        .status()
+        .await;
+
+    // 5. Upload result and clean up
+    if ffmpeg_status.is_ok_and(|s| s.success()) {
+        if let Err(e) = bot.send_video(chat_id, InputFile::file(&output_path)).reply_to_message_id(user_message_id).await {
+            log::error!("Failed to upload greenscreen video: {}", e);
+            bot.edit_message_text(chat_id, status_msg.id, "❌ Error: Failed to upload the final video.").await.ok();
+        } else {
+            bot.delete_message(chat_id, status_msg.id).await.ok();
+        }
+    } else {
+        // It's helpful to log the ffmpeg command output on failure for debugging
+        let ffmpeg_output = tokio::process::Command::new("ffmpeg")
+            .arg("-i").arg(doakes_path)
+            .arg("-loop").arg("1").arg("-i").arg(&photo_path)
+            .arg("-filter_complex").arg(&filter_complex)
+            .arg("-map").arg("[outv]").arg("-map").arg("0:a?")
+            .arg("-c:a").arg("copy").arg("-c:v").arg("libx264")
+            .arg("-preset").arg("veryfast").arg("-pix_fmt").arg("yuv420p")
+            .arg("-shortest").arg("-y").arg(&output_path)
+            .output().await; // Re-run to capture output
+
+        let error_details = match ffmpeg_output {
+            Ok(output) => String::from_utf8_lossy(&output.stderr).to_string(),
+            Err(e) => e.to_string(),
+        };
+
+        log::error!("FFMPEG greenscreen failed. Stderr: {}", error_details);
+        bot.edit_message_text(chat_id, status_msg.id, "❌ An error occurred during video processing.").await.ok();
+    }
+}
+
+
 async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(), teloxide::RequestError> {
+    let mut is_photo_message = false;
+
+    // --- New: Handle incoming photos for the greenscreen feature ---
+    if let Some(photos) = msg.photo() {
+        is_photo_message = true;
+        // The video file must be present in the bot's running directory.
+        let doakes_path = Path::new("./doakes.mp4");
+        if doakes_path.exists() {
+            if let Some(largest_photo) = photos.iter().max_by_key(|p| p.width * p.height) {
+                // Trigger the background processing task
+                tokio::spawn(create_doakes_video(
+                    bot.clone(),
+                    msg.chat.id,
+                    msg.id,
+                    largest_photo.file.id.clone(),
+                ));
+                return Ok(()); // We've handled this message, so we can exit.
+            }
+        }
+        // If doakes.mp4 is missing or there's no photo data, fall through to the default handlers below.
+    }
+
+    // --- Existing Logic for saving videos ---
     let mut video_to_save: Option<&Video> = None;
     let mut caption_to_save: Option<&str> = None;
     let mut source_message_for_reply = &msg;
@@ -1033,18 +1196,21 @@ async fn handle_message(bot: Bot, msg: Message, pool: SharedState) -> Result<(),
                 bot.send_message(msg.chat.id, "Please provide a caption for the video link.").await?;
                 return Ok(());
             }
-
             let status_msg = bot.send_message(msg.chat.id, "⏳ Downloading and saving video...").reply_to_message_id(msg.id).await?;
-
             tokio::spawn(download_and_process_video(
                 bot.clone(), msg.chat.id, msg.id, status_msg.id,
                 url.to_string(), caption, pool, user.id,
             ));
         } else {
-            bot.send_message(msg.chat.id, "Send a video with a caption or reply to a video with a new caption to save it.").await?;
+             bot.send_message(msg.chat.id, "Send a video with a caption, a link with a caption, or a photo to get a surprise.").await?;
         }
-    } else {
-        bot.send_message(msg.chat.id, "Send a video with a caption or reply to a video with a new caption to save it.").await?;
+    } else if is_photo_message {
+        // This case is hit if a photo was sent but doakes.mp4 was missing on the server.
+        bot.send_message(msg.chat.id, "That's a nice photo! Unfortunately, I can't seem to find my magic video file right now.").await?;
+    }
+    else {
+        // Any other type of message (sticker, audio, etc.)
+        bot.send_message(msg.chat.id, "Send a video with a caption, a link with a caption, or a photo to get a surprise.").await?;
     }
     Ok(())
 }
